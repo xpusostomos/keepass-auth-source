@@ -323,7 +323,12 @@ and actions never invoke keepassxc-cli again for data already in memory."
            (entries '()))
       (dolist (g (keepass-browse--xml-children-tag root 'Group))
         (setq entries (append entries (keepass-browse--collect g ""))))
-      (setq keepass-browse--entries entries)))
+      ;; `keepassxc-cli rm' moves deleted entries to the Recycle Bin; exclude
+      ;; them so a rename (add-new + delete-old) does not show a duplicate.
+      (setq keepass-browse--entries
+            (seq-filter (lambda (e)
+                          (not (string-prefix-p "/Recycle Bin/" (car e))))
+                        entries))))
   keepass-browse--entries)
 
 ;;; Candidates
@@ -385,6 +390,12 @@ that merely looks similar cannot resolve to the wrong entry."
 
 ;;; Actions (each takes an entry path)
 
+(defun keepass-browse-copy-title (path)
+  "Copy the title of the entry at PATH."
+  (interactive "sEntry path: ")
+  (keepass-browse--kill (keepass-browse--field (keepass-browse--entry-get path) "Title")
+                        (format "Title of %s copied" path)))
+
 (defun keepass-browse-copy-username (path)
   "Copy the username of the entry at PATH."
   (interactive "sEntry path: ")
@@ -443,6 +454,7 @@ that merely looks similar cannot resolve to the wrong entry."
     (define-key map (kbd "p") #'keepass-browse-view-copy-password)
     (define-key map (kbd "e") #'keepass-browse-view-edit)
     (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "C-.") #'embark-act)
     map)
   "Keymap for `keepass-browse-view-mode'.")
 
@@ -450,36 +462,54 @@ that merely looks similar cannot resolve to the wrong entry."
   "Major mode for viewing a KeePass entry.  Password is hidden until
 \\[keepass-browse-view-reveal].")
 
+(defvar-local keepass-browse-view--revealed nil
+  "Non-nil while the password is shown in the current view buffer.")
+
 (defvar-local keepass-browse-view-path nil
   "The entry path shown in `keepass-browse-view-mode'.")
 
 (defun keepass-browse--view-menu ()
-  "Return the bottom key-menu hint line for the view buffer."
-  "\n\n[r] reveal password   [u] copy username   [p] copy password   [e] edit   [q] quit")
+  "Return the bottom key-menu hint lines for the view buffer."
+  "\n\n[r] reveal password\n[u] copy username\n[p] copy password\n[e] edit\n[q] quit")
 
 (defun keepass-browse-view-update (reveal)
-  "Redraw the current view buffer, revealing the password when REVEAL."
+  "Redraw the current view buffer, revealing the password when REVEAL.
+The password appears once, on its own line after the username.  It is hidden
+until toggled with `keepass-browse-view-reveal', unless it is empty, in
+which case there is nothing to hide."
   (let* ((entry (keepass-browse--entry-get keepass-browse-view-path))
-         (pw (if reveal
-                 (keepass-browse--field entry "Password")
+         (pw-field (keepass-browse--field entry "Password"))
+         (pw (if (or reveal (string-blank-p pw-field))
+                 pw-field
                "[hidden - press r]")))
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (dolist (f '("Title" "UserName" "URL" "Notes"))
+      (dolist (f '("Title" "UserName"))
         (insert (format "%-10s %s\n" f (keepass-browse--field entry f))))
       (insert (format "%-10s %s\n" "Password" pw))
+      (dolist (f '("URL" "Notes"))
+        (insert (format "%-10s %s\n" f (keepass-browse--field entry f))))
       (insert (keepass-browse--view-menu)))
     (goto-char (point-min)))
   (setq buffer-read-only t))
 
 (defun keepass-browse-view-reveal ()
-  "Reveal and copy the password of the entry in the view buffer."
+  "Toggle showing the password in the view buffer.
+A press reveals (and copies) the password; a second press hides it again.
+Does nothing for an entry with no password."
   (interactive)
-  (keepass-browse--kill (keepass-browse--field
-                         (keepass-browse--entry-get keepass-browse-view-path)
-                         "Password")
-                        "Password copied to clipboard")
-  (keepass-browse-view-update t))
+  (if (string-blank-p (keepass-browse--field
+                       (keepass-browse--entry-get keepass-browse-view-path)
+                       "Password"))
+      (message "No password for this entry")
+    (setq-local keepass-browse-view--revealed
+                (not keepass-browse-view--revealed))
+    (when keepass-browse-view--revealed
+      (keepass-browse--kill (keepass-browse--field
+                             (keepass-browse--entry-get keepass-browse-view-path)
+                             "Password")
+                            "Password copied to clipboard"))
+    (keepass-browse-view-update keepass-browse-view--revealed)))
 
 (defun keepass-browse-view-copy-username ()
   "Copy the username of the entry in the view buffer."
@@ -508,6 +538,18 @@ that merely looks similar cannot resolve to the wrong entry."
       (setq-local keepass-browse-view-path path)
       (keepass-browse-view-update nil))
     (switch-to-buffer buf)))
+
+(defun keepass-browse-view-refresh (&optional new-path)
+  "Redraw the open view buffer from the (reloaded) database.
+NEW-PATH, when given, re-points the view at the entry's new path (after a
+rename).  Does nothing if no view buffer is open."
+  (let ((buf (get-buffer "*keepass-browse-view*")))
+    (when buf
+      (keepass-browse--load-entries t) ; force re-export of the database
+      (with-current-buffer buf
+        (when new-path
+          (setq-local keepass-browse-view-path new-path))
+        (keepass-browse-view-update keepass-browse-view--revealed)))))
 
 
 ;;; Entry buffer (add / clone / edit)
@@ -558,7 +600,7 @@ TEMPLATE is the initial text; defaults to blank standard fields."
     (with-current-buffer buf
       (insert (or template
                   (mapconcat (lambda (f) (format "%s: " f))
-                             '("Title" "UserName" "Password" "URL") "\n")))
+                             '("Title" "UserName" "Password" "URL" "Notes") "\n")))
       (goto-char (point-min))
       (keepass-browse-entry-mode)
       (setq-local keepass-browse--entry-action action)
@@ -566,26 +608,42 @@ TEMPLATE is the initial text; defaults to blank standard fields."
     (switch-to-buffer buf)))
 
 (defun keepass-browse--parse-entry ()
-  "Parse the current entry buffer into a FIELD . VALUE alist."
+  "Parse the current entry buffer into a FIELD . VALUE alist.
+Each field is a single line, except Notes, which extends from after
+\"Notes: \" to the end of the buffer, so multi-line notes are preserved."
   (goto-char (point-min))
-  (let ((result '()))
-    (while (re-search-forward "^\\([A-Za-z]+\\): ?\\(.*\\)$" nil t)
-      (let ((key (match-string 1)))
-        (when (keepass-browse--valid-field-p key)
-          (setq result (cons (cons key (match-string 2)) result)))))
+  (let ((result '())
+        (keys '("Title" "UserName" "Password" "URL")))
+    (dolist (key keys)
+      (when (re-search-forward (concat "^" key ": ?\\(.*\\)$") nil t)
+        (setq result (cons (cons key (match-string 1)) result))))
+    ;; Notes is last: everything from after "Notes: " to the end of the
+    ;; buffer belongs to it, so multi-line notes survive intact.
+    (goto-char (point-min))
+    (when (re-search-forward "^Notes: ?" nil t)
+      (let ((notes (buffer-substring-no-properties (point) (point-max))))
+        (setq result (cons (cons "Notes" (string-trim notes)) result))))
     (nreverse result)))
 
 ;;; Add / edit / clone / delete
 
-(defun keepass-browse-add ()
-  "Add a new entry.  Choose a group by completion, then a title."
-  (interactive)
+(defun keepass-browse-add (&optional target)
+  "Add a new entry.
+When invoked as an Embark action, TARGET is the selected entry's path and
+the new entry is created in the same group as that entry.  When called
+directly, the group is chosen by completion.  Fill in the Title (after the
+group prefix) and the other fields, then commit with
+`keepass-browse--entry-commit'."
+  (interactive "sEntry path: ")
   (keepass-browse--require-db)
-  (let* ((group (keepass-browse--choose-group))
-         (title (read-string "Title: "))
-         (path (concat group title)))
+  (let* ((group (if (and target (not (string-blank-p target)))
+                    ;; Same group as the selected entry.  file-name
+                    ;; operations on a bare entry path are harmless here
+                    ;; (no remote-name syntax can arise from a clean path).
+                    (file-name-directory (concat "/" (string-trim-left target "/")))
+                  (keepass-browse--choose-group))))
     (keepass-browse--entry-open "*keepass-browse-add*" "add" nil
-                                (format "Title: %s\nUserName: \nPassword: \nURL: \n" path))))
+                                (format "Title: %s\nUserName: \nPassword: \nURL: \nNotes: \n" group))))
 
 (defun keepass-browse--choose-group ()
   "Choose a KeePass group path by completion (ends in /)."
@@ -601,11 +659,12 @@ so editing does not become a spurious add/delete."
   (let* ((entry (keepass-browse--entry-get path))
          (title (file-name-nondirectory (directory-file-name path))))
     (keepass-browse--entry-open "*keepass-browse-edit*" "edit" path
-                                (format "Title: %s\nUserName: %s\nPassword: %s\nURL: %s\n"
+                                (format "Title: %s\nUserName: %s\nPassword: %s\nURL: %s\nNotes: %s\n"
                                         title
                                         (keepass-browse--field entry "UserName")
                                         (keepass-browse--field entry "Password")
-                                        (keepass-browse--field entry "URL")))))
+                                        (keepass-browse--field entry "URL")
+                                        (keepass-browse--field entry "Notes")))))
 
 (defun keepass-browse-clone (path)
   "Clone the entry at PATH into an entry buffer."
@@ -614,7 +673,7 @@ so editing does not become a spurious add/delete."
     (keepass-browse--entry-open "*keepass-browse-clone*" "add" nil
                                 (mapconcat (lambda (f)
                                              (format "%s: %s" f (keepass-browse--field entry f)))
-                                           '("Title" "UserName" "Password" "URL")
+                                           '("Title" "UserName" "Password" "URL" "Notes")
                                            "\n"))))
 
 (defun keepass-browse--delete-entry (path)
@@ -628,6 +687,13 @@ so editing does not become a spurious add/delete."
     (if (eq (cdr run) 0)
         (progn
           (setq keepass-browse--entries nil) ; invalidate cache
+          ;; If the deleted entry is displayed in the view buffer, close it --
+          ;; its path no longer exists, so it could only show stale data.
+          (let ((view (get-buffer "*keepass-browse-view*")))
+            (when (and view
+                       (with-current-buffer view
+                         (equal keepass-browse-view-path path)))
+              (kill-buffer view)))
           (message "Deleted %s" path))
       (keepass-browse--error (car run)))))
 
@@ -638,46 +704,54 @@ so editing does not become a spurious add/delete."
     (keepass-browse--delete-entry path)))
 
 (defun keepass-browse--entry-commit ()
-  "Commit the add/clone/edit in the current entry buffer."
+  "Commit the add/clone/edit in the current entry buffer.
+An edit uses `keepassxc-cli edit' in place (passing `-t' when the title
+changed), so a rename is not a delete+add and never creates a Recycle-Bin
+duplicate.  A new entry uses `keepassxc-cli add'."
   (interactive)
   (let* ((entry (keepass-browse--parse-entry))
          (action (buffer-local-value 'keepass-browse--entry-action (current-buffer)))
          (original (buffer-local-value 'keepass-browse--entry-original (current-buffer)))
          (title (string-trim (keepass-browse--field entry "Title")))
          (password (keepass-browse--field entry "Password"))
-         (delete-old nil)
-         (cli-action "add")
-         ;; The full path is rebuilt from the original's directory + the
-         ;; (possibly renamed) title, so keepassxc-cli gets a real path and a
-         ;; same-name edit stays an edit rather than a spurious add/delete.
-         (base (if original (file-name-directory original) ""))
-         (target (if (string-prefix-p "/" title) title (concat base title))))
+         (path (cond ((string= action "edit")
+                      ;; keepassxc-cli `edit' renames within the current group
+                      ;; via -t; the entry is at ORIGINAL.
+                      original)
+                     ;; add/clone: create under the original entry's group.
+                     (t (concat (if original (file-name-directory original) "")
+                                (if (string-prefix-p "/" title) title title))))))
     (when (string-empty-p title)
       (user-error "Title may not be empty"))
-    (when (and (string= action "edit")
-               original
-               (not (string= original target)))
-      ;; The title (and thus path) changed: add the new path, then delete old.
-      (setq delete-old t cli-action "add"))
-    (unless delete-old
-      (setq cli-action (if (string= action "edit") "edit" "add")))
     (let* ((stdin (concat (keepass-browse--read-password) "\n"
                           password "\n"))
-           (run (keepass-browse--run-stdin
-                 stdin
-                 cli-action keepass-browse-database-file
-                 target
-                 "-u" (keepass-browse--field entry "UserName")
-                 "--url" (keepass-browse--field entry "URL")
-                 "-p")))
-      (if (eq (cdr run) 0)
-          (progn
-            (when delete-old
-              (keepass-browse--delete-entry original))
-            (setq keepass-browse--entries nil) ; invalidate cache
-            (kill-buffer (current-buffer))
-            (message "keepassxc-cli %s entry \"%s\"" cli-action title))
-        (keepass-browse--error (car run))))))
+           (cli (if (string= action "edit") "edit" "add"))
+           ;; `-t' (title) exists only on `edit'; for `add' the title is part
+           ;; of the entry path and is not passed separately.
+           (common (list "-u" (keepass-browse--field entry "UserName")
+                         "--url" (keepass-browse--field entry "URL")
+                         "--notes" (keepass-browse--field entry "Notes")
+                         "-p"))
+           (args (if (string= action "edit")
+                     (append (list cli keepass-browse-database-file path
+                                   "-t" title)
+                             common)
+                   (append (list cli keepass-browse-database-file path)
+                           common))))
+      (let ((run (apply #'keepass-browse--run-stdin stdin args)))
+        (if (eq (cdr run) 0)
+            (progn
+              (setq keepass-browse--entries nil) ; invalidate cache
+              ;; Re-point and redraw the view buffer at the entry as it now
+              ;; exists: for an edit it may have been renamed via -t; for a
+              ;; clone it is the newly created copy.
+              (keepass-browse-view-refresh
+               (if (string= action "edit")
+                   (concat (file-name-directory (or original "")) title)
+                 path))
+              (kill-buffer (current-buffer))
+              (message "keepassxc-cli %s entry \"%s\"" cli title))
+          (keepass-browse--error (car run)))))))
 
 ;;; Embark integration
 
@@ -697,37 +771,76 @@ structure rather than by parsing the display."
 
 (defun keepass-browse--embark-target ()
   "Embark target for the entry under point or in the selection minibuffer.
-Returns (PATH . keepass-browse) so Embark routes to
-`keepass-browse-action-map'."
+The target type depends on the context: from the selection minibuffer it is
+`keepass-browse-select' (whose menu includes the insert actions, which only
+make sense while the originating buffer's point is preserved); elsewhere it
+is `keepass-browse'."
   (let (path)
     (cond
      ;; In the listing buffer: the entry at point.
      ((derived-mode-p 'keepass-browse-mode)
       (setq path (get-text-property (point) 'kb-path)))
+     ;; In the view buffer: the entry being viewed.
+     ((derived-mode-p 'keepass-browse-view-mode)
+      (setq path keepass-browse-view-path))
      ;; In the selection minibuffer: the current candidate.
      ((and (active-minibuffer-window) keepass-browse--selecting)
       (setq path (keepass-browse--path-from-minibuffer))))
-    (when path (cons path 'keepass-browse))))
+    (when path
+      (if (and (active-minibuffer-window) keepass-browse--selecting)
+          (cons 'keepass-browse-select path)
+        (cons 'keepass-browse path)))))
 
 (add-to-list 'embark-target-finders #'keepass-browse--embark-target)
 
 (defvar-keymap keepass-browse-action-map
-  :doc "Embark actions for a keepass-browse entry target."
-  "u" #'keepass-browse-copy-username
-  "p" #'keepass-browse-copy-password
-  "l" #'keepass-browse-copy-url
-  "n" #'keepass-browse-copy-notes
-  "t" #'keepass-browse-copy-totp
-  "P" #'keepass-browse-insert-username
-  "U" #'keepass-browse-insert-password
-  "r" #'keepass-browse-reveal-password
-  "v" #'keepass-browse-view
-  "e" #'keepass-browse-edit
-  "c" #'keepass-browse-clone
+  :doc "Embark actions for a keepass-browse entry target.
+Used in the view and listing buffers, where point is not in an editing
+context and the insert actions do not apply.  Copy actions are listed in
+the canonical field order: Title, UserName, Password, URL, Notes.
+NOTE: bindings are defined in reverse so the Embark menu *displays* them
+in that order (keymap iteration is reverse of definition)."
+  "RET" #'keepass-browse-run-default-action
+  "d" #'keepass-browse-delete
   "a" #'keepass-browse-add
-  "d" #'keepass-browse-delete)
+  "c" #'keepass-browse-clone
+  "e" #'keepass-browse-edit
+  "v" #'keepass-browse-view
+  "o" #'keepass-browse-copy-totp
+  "n" #'keepass-browse-copy-notes
+  "l" #'keepass-browse-copy-url
+  "p" #'keepass-browse-copy-password
+  "u" #'keepass-browse-copy-username
+  "t" #'keepass-browse-copy-title)
+
+(defvar-keymap keepass-browse-select-action-map
+  :doc "Embark actions for a keepass-browse entry selected from the
+selection minibuffer.  Inherits the base actions and adds the insert
+actions, which make sense because the point of the originating buffer is
+preserved while the minibuffer is active."
+  :parent keepass-browse-action-map
+  "P" #'keepass-browse-insert-username
+  "U" #'keepass-browse-insert-password)
+;; The default Embark action for our target types is `keepass-browse-view'
+;; (via the wrapper), not -- as Embark would otherwise fall back to for
+;; minibuffer targets -- the command that opened the minibuffer
+;; (`keepass-browse' itself), which would run the selector recursively and
+;; error.
+(mapc (lambda (type)
+        (add-to-list 'embark-default-action-overrides
+                     (cons type #'keepass-browse-run-default-action)))
+      '(keepass-browse keepass-browse-select))
+
+(defun keepass-browse-run-default-action (path)
+  "Run `keepass-browse-default-action' on the entry at PATH.
+A command wrapper so RET in the action map can invoke whatever function
+`keepass-browse-default-action' names."
+  (interactive "sEntry path: ")
+  (funcall keepass-browse-default-action path))
 
 (add-to-list 'embark-keymap-alist '(keepass-browse . keepass-browse-action-map))
+(add-to-list 'embark-keymap-alist
+             '(keepass-browse-select . keepass-browse-select-action-map))
 
 ;;; Listing buffer
 
