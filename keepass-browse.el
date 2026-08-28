@@ -102,6 +102,26 @@ password directly on RET."
                  (function :tag "None (just return the path)" ignore))
   :group 'keepass-browse)
 
+;; The single source of truth for the entry actions.  Both the Embark action
+;; keymaps and the visible key-menu on the view screen are generated from
+;; this list, so the two menus can never drift apart.  Each element is
+;; (KEY LABEL FUNCTION), where FUNCTION takes an entry path.
+(defconst keepass-browse--actions
+  '(("t" "copy title"    keepass-browse-copy-title)
+    ("u" "copy username" keepass-browse-copy-username)
+    ("p" "copy password" keepass-browse-copy-password)
+    ("l" "copy url"      keepass-browse-copy-url)
+    ("n" "copy notes"    keepass-browse-copy-notes)
+    ("o" "copy totp"     keepass-browse-copy-totp)
+    ("v" "view"          keepass-browse-view)
+    ("e" "edit"          keepass-browse-edit)
+    ("c" "clone"         keepass-browse-clone)
+    ("a" "add"           keepass-browse-add)
+    ("d" "delete"        keepass-browse-delete))
+  "Actions for a keepass-browse entry, in canonical field order.
+See `keepass-browse--action-map'.  (TOTP is the entry's time-based one-time
+password, i.e. a stored two-factor code; see `keepass-browse-copy-totp'.)")
+
 ;;; Internal state
 
 (defvar keepass-browse--entries nil
@@ -446,17 +466,22 @@ that merely looks similar cannot resolve to the wrong entry."
     (keepass-browse--kill (keepass-browse--field entry "Password")
                           "Password copied to clipboard")))
 
-(defvar keepass-browse-view-mode-map
+(defconst keepass-browse-view-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
+    ;; Each action operates on the entry being viewed.
+    (pcase-dolist (`(,key ,_label ,fn) keepass-browse--actions)
+      (define-key map (kbd key)
+        (lambda ()
+          (interactive)
+          (funcall fn keepass-browse-view-path))))
     (define-key map (kbd "r") #'keepass-browse-view-reveal)
-    (define-key map (kbd "u") #'keepass-browse-view-copy-username)
-    (define-key map (kbd "p") #'keepass-browse-view-copy-password)
-    (define-key map (kbd "e") #'keepass-browse-view-edit)
     (define-key map (kbd "q") #'quit-window)
     (define-key map (kbd "C-.") #'embark-act)
     map)
-  "Keymap for `keepass-browse-view-mode'.")
+  "Keymap for `keepass-browse-view-mode', generated from
+`keepass-browse--actions'; each action operates on the viewed entry.  The
+password reveal (r) and quit (q) are view-only.")
 
 (define-derived-mode keepass-browse-view-mode special-mode "kb-view"
   "Major mode for viewing a KeePass entry.  Password is hidden until
@@ -469,8 +494,26 @@ that merely looks similar cannot resolve to the wrong entry."
   "The entry path shown in `keepass-browse-view-mode'.")
 
 (defun keepass-browse--view-menu ()
-  "Return the bottom key-menu hint lines for the view buffer."
-  "\n\n[r] reveal password\n[u] copy username\n[p] copy password\n[e] edit\n[q] quit")
+  "Return the key menu shown at the bottom of the view buffer.
+Generated from `keepass-browse--actions' plus the view-only reveal and
+quit, laid out in two columns.  The view action itself is omitted: this
+menu is only shown when already viewing an entry."
+  (let* ((items (append (seq-filter
+                         (lambda (i) (not (equal (car i) "v")))
+                         keepass-browse--actions)
+                        '(("r" "reveal password")
+                          ("q" "quit"))))
+         (half (ceiling (length items) 2))
+         (width (apply #'max 0 (mapcar (lambda (i) (length (cadr i))) items)))
+         (fmt (format "[%%c] %%-%ds   %%s" width))
+         (rows '()))
+    (dotimes (i half)
+      (let ((l (nth i items))
+            (r (nth (+ half i) items)))
+        (push (format fmt (aref (car l) 0) (cadr l)
+                      (if r (format "[%c] %s" (aref (car r) 0) (cadr r)) ""))
+              rows)))
+    (concat "\n\n" (string-join (nreverse rows) "\n"))))
 
 (defun keepass-browse-view-update (reveal)
   "Redraw the current view buffer, revealing the password when REVEAL.
@@ -771,47 +814,56 @@ structure rather than by parsing the display."
 
 (defun keepass-browse--embark-target ()
   "Embark target for the entry under point or in the selection minibuffer.
-The target type depends on the context: from the selection minibuffer it is
-`keepass-browse-select' (whose menu includes the insert actions, which only
-make sense while the originating buffer's point is preserved); elsewhere it
-is `keepass-browse'."
-  (let (path)
+The target type depends on the context, so Embark shows the right menu:
+`keepass-browse-view' in the view buffer (whose menu omits the redundant
+view action), `keepass-browse' in the listing buffer, and
+`keepass-browse-select' in the selection minibuffer (whose menu adds the
+insert actions, which only make sense while the originating buffer's point
+is preserved)."
+  (let (path type)
     (cond
      ;; In the listing buffer: the entry at point.
      ((derived-mode-p 'keepass-browse-mode)
-      (setq path (get-text-property (point) 'kb-path)))
+      (setq type 'keepass-browse
+            path (get-text-property (point) 'kb-path)))
      ;; In the view buffer: the entry being viewed.
      ((derived-mode-p 'keepass-browse-view-mode)
-      (setq path keepass-browse-view-path))
+      (setq type 'keepass-browse-view
+            path keepass-browse-view-path))
      ;; In the selection minibuffer: the current candidate.
      ((and (active-minibuffer-window) keepass-browse--selecting)
-      (setq path (keepass-browse--path-from-minibuffer))))
-    (when path
-      (if (and (active-minibuffer-window) keepass-browse--selecting)
-          (cons 'keepass-browse-select path)
-        (cons 'keepass-browse path)))))
+      (setq type 'keepass-browse-select
+            path (keepass-browse--path-from-minibuffer))))
+    (when path (cons type path))))
 
 (add-to-list 'embark-target-finders #'keepass-browse--embark-target)
 
-(defvar-keymap keepass-browse-action-map
-  :doc "Embark actions for a keepass-browse entry target.
-Used in the view and listing buffers, where point is not in an editing
-context and the insert actions do not apply.  Copy actions are listed in
-the canonical field order: Title, UserName, Password, URL, Notes.
-NOTE: bindings are defined in reverse so the Embark menu *displays* them
-in that order (keymap iteration is reverse of definition)."
-  "RET" #'keepass-browse-run-default-action
-  "d" #'keepass-browse-delete
-  "a" #'keepass-browse-add
-  "c" #'keepass-browse-clone
-  "e" #'keepass-browse-edit
-  "v" #'keepass-browse-view
-  "o" #'keepass-browse-copy-totp
-  "n" #'keepass-browse-copy-notes
-  "l" #'keepass-browse-copy-url
-  "p" #'keepass-browse-copy-password
-  "u" #'keepass-browse-copy-username
-  "t" #'keepass-browse-copy-title)
+(defun keepass-browse--build-action-map (&optional excluded)
+  "Build an Embark action keymap from `keepass-browse--actions'.
+EXCLUDED is a list of keys (e.g. \"v\") to leave out.  define-key prepends,
+so the list is walked in reverse to make the menu *display* the actions in
+canonical field order; RET (the default action) is defined first so it
+displays last."
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'keepass-browse-run-default-action)
+    (dolist (entry (reverse keepass-browse--actions))
+      (pcase-let ((`(,key ,_label ,fn) entry))
+        (unless (member key excluded)
+          (define-key map (kbd key) fn))))
+    map))
+
+(defconst keepass-browse-action-map
+  (keepass-browse--build-action-map)
+  "Embark actions for a keepass-browse entry target.
+Used in the listing buffer, where point is not in an editing context and
+the insert actions do not apply.  Copy actions are listed in the canonical
+field order: Title, UserName, Password, URL, Notes.")
+
+(defconst keepass-browse-view-action-map
+  (keepass-browse--build-action-map '("v"))
+  "Embark actions for the entry shown in the view buffer.
+Same as `keepass-browse-action-map' minus `v' (view): the view buffer
+already shows the entry, so re-viewing it is meaningless.")
 
 (defvar-keymap keepass-browse-select-action-map
   :doc "Embark actions for a keepass-browse entry selected from the
@@ -829,7 +881,13 @@ preserved while the minibuffer is active."
 (mapc (lambda (type)
         (add-to-list 'embark-default-action-overrides
                      (cons type #'keepass-browse-run-default-action)))
-      '(keepass-browse keepass-browse-select))
+      '(keepass-browse keepass-browse-view keepass-browse-select))
+
+(add-to-list 'embark-keymap-alist '(keepass-browse . keepass-browse-action-map))
+(add-to-list 'embark-keymap-alist
+             '(keepass-browse-view . keepass-browse-view-action-map))
+(add-to-list 'embark-keymap-alist
+             '(keepass-browse-select . keepass-browse-select-action-map))
 
 (defun keepass-browse-run-default-action (path)
   "Run `keepass-browse-default-action' on the entry at PATH.
@@ -837,10 +895,6 @@ A command wrapper so RET in the action map can invoke whatever function
 `keepass-browse-default-action' names."
   (interactive "sEntry path: ")
   (funcall keepass-browse-default-action path))
-
-(add-to-list 'embark-keymap-alist '(keepass-browse . keepass-browse-action-map))
-(add-to-list 'embark-keymap-alist
-             '(keepass-browse-select . keepass-browse-select-action-map))
 
 ;;; Listing buffer
 
