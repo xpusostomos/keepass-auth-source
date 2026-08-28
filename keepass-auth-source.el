@@ -237,21 +237,6 @@ EXIT the process exit status."
             (cons (with-current-buffer out-buf (buffer-string)) exit)))
       (kill-buffer out-buf))))
 
-(defun keepass-auth-source--keepassxc-entry-paths (entity password status-var)
-  "Return the list of entry paths in ENTITY via `ls -R -f'.
-Calls STATUS-VAR with the raw merged output (for diagnostics).  Returns
-nil if the master password is wrong (non-zero exit code)."
-  (let* ((run (keepass-auth-source--keepassxc-run
-               password "ls" "-q" "-R" "-f" entity))
-         (output (car run))
-         (exit (cdr run)))
-    (funcall status-var output)
-    (if (not (eq exit 0))
-        nil
-      (seq-filter
-       (lambda (line) (not (string-suffix-p "/" line))) ; drop group rows
-       (split-string output "\n" t)))))
-
 (defun keepass-auth-source-keepassxc-term (spec)
   "Return the keepassxc-cli `search' query for SPEC, or nil.
 
@@ -362,21 +347,6 @@ are returned, instead of every entry in the database."
     (when (eq exit 0)
       (seq-filter (lambda (s) (not (string-blank-p s)))
         (split-string output "\n" t)))))
-
-(defun keepass-auth-source--keepassxc-entry-paths (entity password status-var)
-  "Return the list of entry paths in ENTITY via `ls -R -f'.
-Calls STATUS-VAR with the raw merged output (for diagnostics).  Returns
-nil if the master password is wrong (non-zero exit code)."
-  (let* ((run (keepass-auth-source--keepassxc-run
-               password "ls" "-q" "-R" "-f" entity))
-         (output (car run))
-         (exit (cdr run)))
-    (funcall (or status-var #'ignore) output)
-    (if (not (eq exit 0))
-        nil
-      (seq-filter
-       (lambda (line) (not (string-suffix-p "/" line))) ; drop group rows
-       (split-string output "\n" t)))))
 
 (defun keepass-auth-source--keepassxc-locked-p (status)
   "Return non-nil if STATUS indicates a wrong master password.
