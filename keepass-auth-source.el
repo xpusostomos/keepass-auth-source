@@ -208,20 +208,87 @@ password."
               "\n")
    port))
 
-(defun keepass-auth-source--keepassxc-run (password &rest args)
-  "Run keepassxc-cli ARGS, feeding PASSWORD on standard input.
-Uses `call-process-region' with an OUTPUT buffer that is separate from the
-password-input region, which is synchronous, creates no asynchronous process
-buffers, and avoids the buffer-reuse deadlock that can hang an interactive
-Emacs.  Returns (OUTPUT . EXIT), OUTPUT being the merged stdout+stderr and
-EXIT the process exit status."
-  (when keepass-auth-source-verbose
-    (let ((line (format "keepassxc-cli %s" (mapconcat #'identity args " "))))
-      (with-current-buffer (get-buffer-create "*keepass-auth-source-log*")
+(defun keepass-auth-source--normalize-db (spec)
+  "Normalize a database SPEC to (PATH KEYFILE PASSWORD).
+
+SPEC is one `auth-sources' entry (or the value of
+`keepass-browse-database-file').  It is either a string -- the database
+path, with no key file and an interactively-requested password -- or a
+list:
+
+  (PATH [KEYFILE] [PASSWORD])
+
+PATH is the database file name.  KEYFILE, if present and non-nil, is
+either a string (the key file's name) or a function of no arguments
+returning the file name; nil means no key file.  PASSWORD, if present, is
+either the master password itself (a string) or a no-argument function
+returning it; nil means prompt the user as usual (via `password-cache').
+
+Returns (PATH KEYFILE PASSWORD) where KEYFILE is a file-name string or
+nil and PASSWORD is a string, a function, or nil (meaning prompt)."
+  (let ((path spec) keyfile password)
+    (when (consp spec)
+      (setq path (nth 0 spec)
+            keyfile (nth 1 spec)
+            password (nth 2 spec)))
+    (list path keyfile password)))
+
+(defun keepass-auth-source--resolve-keyfile (keyfile)
+  "Resolve a key file specification KEYFILE to a file name, or nil.
+A string is the file name; a function is called to obtain it; anything
+else (including nil) means no key file."
+  (pcase keyfile
+    ((pred stringp) keyfile)
+    ((pred functionp) (funcall keyfile))
+    (_ nil)))
+
+(defun keepass-auth-source--resolve-password (password-spec db &optional expiry)
+  "Return the master password for DB from its PASSWORD-SPEC.
+A string is returned as-is, a function is called to obtain it, and nil or
+absent means prompt the user (and cache under DB) as usual, honouring
+EXPIRY as in `keepass-auth-source--read-password'."
+  (pcase password-spec
+    ((pred stringp) password-spec)
+    ((pred functionp) (funcall password-spec))
+    (_ (keepass-auth-source--read-password db expiry))))
+
+(defun keepass-auth-source--read-password (db &optional expiry)
+  "Read the master password for database DB, caching it for reuse.
+The cache entry is keyed by DB, so multiple databases each keep their own
+master password.  EXPIRY defaults to `keepass-auth-source-cache-expiry'.
+Returns the password."
+  (let* ((prompt (format "Keepass password (%s): " db))
+         (password-cache-expiry (or expiry keepass-auth-source-cache-expiry))
+         (password (cond
+                    ((password-read-from-cache db))
+                    ((password-read prompt db)))))
+    (password-cache-add db password)
+    password))
+
+(defun keepass-auth-source--keyfile-args (keyfile)
+  "Return the keepassxc-cli arguments for key file KEYFILE.
+KEYFILE is a file-name string, a no-argument function returning one, or
+nil for no key file.  Returns (\"--key-file\" FILE) or nil, with FILE
+expanded so a leading \"~\" works."
+  (when-let* ((file (keepass-auth-source--resolve-keyfile keyfile)))
+    (list "--key-file" (expand-file-name file))))
+
+(defun keepass-auth-source--log (format-string &rest args)
+  "Append a line to the *keepass-auth-source-log* buffer (read-only).
+The buffer is never displayed automatically; the user can open it with
+\\[switch-to-buffer] when curious."
+  (let ((line (apply #'format format-string args)))
+    (with-current-buffer (get-buffer-create "*keepass-auth-source-log*")
+      (setq buffer-read-only t)
+      (let ((inhibit-read-only t))
         (goto-char (point-max))
-        (insert line "\n")
-        (display-buffer (current-buffer)))
-      (message "%s" line)))
+        (insert line "\n")))
+    (message "%s" line)))
+
+(defun keepass-auth-source--keepassxc-run (password &rest args)
+  (when keepass-auth-source-verbose
+    (keepass-auth-source--log "keepassxc-cli %s"
+                              (mapconcat #'identity args " ")))
   (let* ((prog (keepass-auth-source--keepassxc-executable))
          (out-buf (generate-new-buffer " *keepass-auth-source-out*")))
     (unwind-protect
@@ -237,6 +304,38 @@ EXIT the process exit status."
             (cons (with-current-buffer out-buf (buffer-string)) exit)))
       (kill-buffer out-buf))))
 
+(defun keepass-auth-source--keepassxc-run-stdin (stdin &rest args)
+  "Run keepassxc-cli ARGS feeding STDIN (a string) on standard input.
+Like `keepass-auth-source--keepassxc-run', for commands that need more on
+standard input than the database password alone (e.g. `add'/`edit' with
+the new entry's password).  Returns (OUTPUT . EXIT)."
+  (let* ((prog (keepass-auth-source--keepassxc-executable))
+         (out-buf (generate-new-buffer " *keepass-auth-source-out*")))
+    (unwind-protect
+        (with-temp-buffer
+          (when keepass-auth-source-verbose
+            (keepass-auth-source--log "keepassxc-cli %s"
+                                      (mapconcat #'identity args " ")))
+          (insert stdin)
+          (let ((exit (apply #'call-process-region
+                             (point-min) (point-max)
+                             prog t (list out-buf) nil
+                             args)))
+            (cons (with-current-buffer out-buf (buffer-string)) exit)))
+      (kill-buffer out-buf))))
+
+(defun keepass-auth-source--error (output &optional db)
+  "Signal an error describing a failed keepassxc-cli run (OUTPUT).
+DB, when given, is the database whose cached master password should be
+dropped when the credentials were wrong."
+  (let ((msg (string-trim output)))
+    (cond
+     ((string-match-p "Invalid credentials were provided" msg)
+      (when db (password-cache-remove db))
+      (user-error "Incorrect master password"))
+     (t (user-error "keepassxc-cli failed: %s"
+                    (if (> (length msg) 0) msg "unknown error"))))))
+
 (defun keepass-auth-source-keepassxc-term (spec)
   "Return the keepassxc-cli `search' query for SPEC, or nil.
 
@@ -248,16 +347,20 @@ candidate set without assuming which combination of keys the caller passed;
 the candidate set is then filtered precisely against every present key.
 
 Each auth-source key maps to one canonical field:
-  host     -> url:HOST        (or url:HOST:PORT when a port is given)
+  host     -> url:HOST
   user     -> user:USER
   title    -> title:TITLE
   password -> password:PASSWORD
   notes    -> notes:NOTES
 
+The port is deliberately NOT folded into the url term: many entries store a
+bare host or a scheme://host URL, and a \"host:port\" substring would
+exclude them before the precise matcher ever runs.  The matcher enforces
+port semantics instead.
+
 All present keys are joined with spaces, so a search for \"host=A, user=B\"
 runs the single command: A-AND-B in one keepassxc-cli call."
   (let* ((host (plist-get spec :host))
-         (port (plist-get spec :port))
          (user (plist-get spec :user))
          (title (plist-get spec :title))
          (password (plist-get spec :password))
@@ -266,9 +369,7 @@ runs the single command: A-AND-B in one keepassxc-cli call."
           (delq nil
                 (list
                  (and host (not (string-blank-p host))
-                      (format "url:%s%s" host
-                              (if (and port (not (string-blank-p (format "%s" port))))
-                                  (format ":%s" port) "")))
+                      (format "url:%s" host))
                  (and user (not (string-blank-p user))
                       (format "user:%s" user))
                  (and title (not (string-blank-p title))
@@ -336,12 +437,17 @@ Applies host/user/port to the canonical KeePass fields:
          (or (string-blank-p (or notes ""))    ; notes matches
              (keepass-auth-source-s-contains-p notes e-notes t)))))))
 
-(defun keepass-auth-source--keepassxc-narrow (entity password term)
+(defun keepass-auth-source--keepassxc-narrow (entity password term &optional keyfile)
   "Return the entry paths in ENTITY whose any field contains TERM.
 Uses the server-side `search' command so only a handful of candidates
-are returned, instead of every entry in the database."
-  (let* ((run (keepass-auth-source--keepassxc-run
-               password "search" "-q" entity term))
+are returned, instead of every entry in the database.  KEYFILE, when
+non-nil, is the database's key file (see
+`keepass-auth-source--keyfile-args')."
+  (let* ((run (apply #'keepass-auth-source--keepassxc-run
+                     password
+                     (append (list "search" "--quiet")
+                             (keepass-auth-source--keyfile-args keyfile)
+                             (list entity term))))
          (output (car run))
          (exit (cdr run)))
     (when (eq exit 0)
@@ -366,21 +472,28 @@ candidate set, then `show's only those candidates and filters them against
 the full SPEC.  Returns (ENTRIES . STATUS)."
   (let* ((status nil)
          (db (plist-get spec :db))
+         (keyfile (plist-get spec :keyfile))
          (term (keepass-auth-source-keepassxc-term spec))
-         (open (keepass-auth-source--keepassxc-run
-                password "ls" "-q" db))
+         (open (apply #'keepass-auth-source--keepassxc-run
+                      password
+                      (append (list "ls" "--quiet")
+                              (keepass-auth-source--keyfile-args keyfile)
+                              (list db))))
          (locked-p (not (eq (cdr open) 0)))
          (paths (and (not locked-p) term
                      (keepass-auth-source--keepassxc-narrow
-                      db password term)))
+                      db password term keyfile)))
          (matcher (keepass-auth-source-keepassxc-spec-matcher spec))
          (entries
          (and paths
                (let* ((shows (mapcar
                               (lambda (path)
-                                (car (keepass-auth-source--keepassxc-run
-                                      password "show" "-q" "-s"
-                                      db path)))
+                                (car (apply #'keepass-auth-source--keepassxc-run
+                                            password
+                                            (append
+                                             (list "show" "--quiet" "--show-protected")
+                                             (keepass-auth-source--keyfile-args keyfile)
+                                             (list db path)))))
                               paths))
                       (entries (mapcar (lambda (show) (keepass-auth-source--keepassxc-parse
                                                        show (plist-get spec :port)))
@@ -415,7 +528,11 @@ nil for backends that do not emit one."
                                       &key backend type host user port max title
                                         &allow-other-keys)
   "Find password for a request, if several passwords are available prompt user to select an entry."
-  (let ((entity (slot-value backend 'source)))
+  (let* ((db-info (keepass-auth-source--normalize-db
+                   (slot-value backend 'source)))
+         (entity (nth 0 db-info))
+         (keyfile (plist-get (slot-value backend 'data) :keyfile))
+         (password-spec (plist-get (slot-value backend 'data) :password-spec)))
     (when (file-exists-p entity)
       (when keepass-auth-source-verbose
         (message "keepass-auth-source-search spec: host=%S user=%S port=%S title=%S"
@@ -427,16 +544,11 @@ nil for backends that do not emit one."
              (host (or (url-host url) ""))
              (max (or max 1))
              (path (or (car (url-path-and-query url)) ""))
-             (password-prompt (format "Keepass password (%s): " entity))
-             (password (let ((password-cache-expiry keepass-auth-source-cache-expiry)
-                             (password
-                              (cond
-                                ((password-read-from-cache entity))
-                                ((password-read password-prompt entity)))))
-                         (password-cache-add entity password)
-                         password))
+             (password (keepass-auth-source--resolve-password
+                        password-spec entity keepass-auth-source-cache-expiry))
              (spec `(:host ,host :user ,user :port ,port :title ,title
-                        :path ,path :db ,entity))
+                        :path ,path :db ,entity
+                        :keyfile ,keyfile))
              (parsed (keepass-auth-source--list-entries entity spec password))
              (result (nth 0 parsed))
              (status (nth 1 parsed)))
@@ -485,12 +597,24 @@ nil for backends that do not emit one."
                 (seq-take used max))))))))))
 
 (defun keepass-auth-source-backend-parser (entry)
-  "Provides keepass backend for files with the .kdbx extension."
-  (when (and (stringp entry)
-             (string-equal "kdbx" (file-name-extension entry)))
-    (auth-source-backend :type 'keepass
-                         :source entry
-                         :search-function #'keepass-auth-source-search)))
+  "Provides keepass backend for files with the .kdbx extension.
+ENTRY may be a plain database file name, or a list
+\(PATH [KEYFILE] [PASSWORD]) -- see `keepass-auth-source--normalize-db'.
+For the list form the key file and password specifications are carried on
+the backend's `data' slot so the search can honour them."
+  (let* ((db (keepass-auth-source--normalize-db entry))
+         (path (nth 0 db)))
+    (when (and (stringp path)
+               (string-equal "kdbx" (file-name-extension path)))
+      (auth-source-backend :type 'keepass
+                           :source path
+                           :search-function #'keepass-auth-source-search
+                           ;; Stash the key file and password specs for the
+                           ;; search function; auth-source's own parameter
+                           ;; parsing ignores unknown list entries.
+                           :data (list :keyfile (nth 1 db)
+                                       :password-spec (nth 2 db))))))
+
 (defun keepass-auth-source--remember-advice (fn spec found)
   "Call auth-source-remember FN unless FOUND is empty.
 Suppresses negative caching: a lookup that finds nothing is not remembered,

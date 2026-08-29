@@ -47,14 +47,13 @@
     db))
 
 (defmacro keepass-browse-test-with-db (&rest body)
-  "Bind a fresh test DB and run BODY with it set as the configured file."
+  "Bind a fresh test DB and run BODY with it set as the active database."
   `(when keepass-browse-test-program
      (let* ((db (keepass-browse-test-make-db))
-            (keepass-browse-database-file db)
+            (keepass-browse-database db)
             (keepass-browse-cache-expiry nil)
             (password-cache-expiry nil))
        (password-cache-add db "PASS")
-       (setq keepass-browse--entries nil) ; fresh cache per test
        (unwind-protect
            (progn ,@body)
          (delete-file db)))))
@@ -192,10 +191,9 @@
 (ert-deftest keepass-browse-wrong-password-errors ()
   "A wrong master password raises an error, not a silent empty result."
   (keepass-browse-test-with-db
-    (setq keepass-browse--entries nil) ; clear any cache from other tests
     (let ((password-cache-expiry nil))
-      (password-cache-add keepass-browse-database-file "WRONG"))
-    (should-error (keepass-browse--load-entries t) :type 'error)))
+      (password-cache-add keepass-browse-database "WRONG"))
+    (should-error (keepass-browse--load-entries) :type 'error)))
 
 (ert-deftest keepass-browse-copy-totp-absent ()
   "Copying TOTP for an entry without one is a clean user-error, not a crash."

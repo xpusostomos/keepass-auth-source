@@ -173,14 +173,22 @@ Runs inside the keepassxc backend with PASS as the master password."
       (delete-file db))))
 
 (ert-deftest keepass-auth-source-integration-host-user-port ()
-  "Host+user+port must select exactly the target, rejecting all decoys."
+  "Host+user+port search selects the target plus the portless record
+(bare-host), rejecting wrong-user, wrong-host and wrong-port decoys."
   (skip-unless keepass-auth-source-test-program)
   (let ((db (keepass-auth-source-test-make-db)))
     (unwind-protect
         (let ((res (keepass-auth-source-test-search
                     db '(:host "x.example.com" :user "alice" :port 443))))
-          (should (= 1 (length res)))
-          (should (string-equal "target" (plist-get (car res) :title))))
+          ;; Lenient port rule: an entry whose URL spells no port still
+          ;; matches a port-requesting search, so both target (:443) and
+          ;; bare-host (no port) are returned; wrong-port (:465) is not.
+          (let ((titles (mapcar (lambda (e) (plist-get e :title)) res)))
+            (should (member "target" titles))
+            (should (member "bare-host" titles))
+            (should-not (member "wrong-port" titles))
+            (should-not (member "wrong-user" titles))
+            (should-not (member "wrong-host" titles))))
       (delete-file db))))
 
 (ert-deftest keepass-auth-source-integration-host-user ()
@@ -246,13 +254,14 @@ A search must return all entries that match *every* key given, and only them."
            "target" "wrong-user" "wrong-port" "bare-host" "same-host-only")
           (keepass-auth-source-test-assert
            db '(:host "y.example.com") "wrong-host")
-          ;; Host + port: URL must contain host:port.
+          ;; Host + port: entries whose URL embeds host:port match, and
+          ;; portless-URL entries are accepted for any requested port.
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :port 443)
-           "target" "wrong-user")
+           "target" "wrong-user" "bare-host" "same-host-only")
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :port 465)
-           "wrong-port")
+           "wrong-port" "bare-host" "same-host-only")
           ;; Host + user.
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :user "alice")
@@ -266,13 +275,13 @@ A search must return all entries that match *every* key given, and only them."
           ;; Host + user + port.
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :user "alice" :port 443)
-           "target")
+           "target" "bare-host")
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :user "bob" :port 443)
            "wrong-user")
           (keepass-auth-source-test-assert
            db '(:host "x.example.com" :user "alice" :port 465)
-           "wrong-port")
+           "wrong-port" "bare-host")
           ;; User alone.
           (keepass-auth-source-test-assert
            db '(:user "alice")
@@ -312,7 +321,10 @@ A search must return all entries that match *every* key given, and only them."
     (should (equal "url:h.example.com"
                    (keepass-auth-source-keepassxc-term
                     '(:host "h.example.com"))))
-    (should (equal "url:h.example.com:443"
+    ;; The port is deliberately NOT folded into the url term: entries often
+    ;; store a bare host, and a "host:port" substring would exclude them
+    ;; before the matcher can apply its port rules.
+    (should (equal "url:h.example.com"
                    (keepass-auth-source-keepassxc-term
                     '(:host "h.example.com" :port 443))))
     (should (equal "user:alice@example.com"
@@ -381,6 +393,38 @@ A search must return all entries that match *every* key given, and only them."
     (should (funcall m '(:host "https://smtp.gmail.com/some/path" :user "x")))
     (should-not (funcall m '(:host "other.example" :user "x")))))
 
+;;;; DB spec normalization
+
+(ert-deftest keepass-auth-source-normalize-db ()
+  "A string or list DB spec normalizes to (PATH KEYFILE PASSWORD)."
+  ;; Plain string: no keyfile, password = prompt (nil).
+  (should (equal '("db.kdbx" nil nil)
+                 (keepass-auth-source--normalize-db "db.kdbx")))
+  ;; (PATH KEYFILE PASSWORD): all present.
+  (should (equal '("db.kdbx" "k.txt" "pw")
+                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt" "pw"))))
+  ;; (PATH KEYFILE): password = nil (prompt).
+  (should (equal '("db.kdbx" "k.txt" nil)
+                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt"))))
+  ;; Key file and password may be functions, retained as-is.
+  (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")))
+    (should (equal (list "db.kdbx" kf ps)
+                   (keepass-auth-source--normalize-db (list "db.kdbx" kf ps))))))
+
+(ert-deftest keepass-auth-source-resolve-keyfile-password ()
+  "Key file and password specs accept strings, functions and nil."
+  ;; Key file: string stays, function is called, nil is nil.
+  (should (equal "k.txt" (keepass-auth-source--resolve-keyfile "k.txt")))
+  (should (equal "k.txt" (keepass-auth-source--resolve-keyfile (lambda () "k.txt"))))
+  (should-not (keepass-auth-source--resolve-keyfile nil))
+  ;; Password: string stays, function is called, nil means prompt (cached).
+  (should (equal "pw" (keepass-auth-source--resolve-password "pw" "db")))
+  (should (equal "pw" (keepass-auth-source--resolve-password (lambda () "pw") "db")))
+  (let ((password-cache-expiry nil))
+    (password-cache-add "resolvedb" "cachedpw")
+    (should (equal "cachedpw"
+                   (keepass-auth-source--resolve-password nil "resolvedb")))))
+
 ;;;; Negative-cache suppression
 
 (ert-deftest keepass-auth-source-suppress-negative-cache ()
@@ -403,6 +447,114 @@ A search must return all entries that match *every* key given, and only them."
             (should (equal '(:secret "s") result))))
       (advice-remove 'auth-source-remember
                      #'keepass-auth-source--remember-advice))))
+
+(ert-deftest keepass-auth-source-multi-db-separate-caches ()
+  "Multiple databases each answer their own queries, each master
+password is cached separately, and entries with portless URLs are found
+by searches that request a port."
+  (let* ((keepass-auth-source-cache-expiry nil)
+        (keepass-auth-source--active-cli 'keepassxc)
+        (dir (make-temp-file "kpa-multi-" t))
+        (db1 (concat (file-name-as-directory (make-temp-file "one-" t)) "one.kdbx"))
+        (db2 (concat (file-name-as-directory (make-temp-file "two-" t)) "two.kdbx"))
+        (auth-sources (list db1 db2)))
+    ;; Register the backend parser, as `keepass-auth-source-enable' would:
+    ;; without it auth-source parses the .kdbx entries with its default
+    ;; (netrc) parser and the search finds no usable backend.
+    (add-hook 'auth-source-backend-parser-functions
+              #'keepass-auth-source-backend-parser)
+    (unless (executable-find "keepassxc-cli")
+      (ert-skip "keepassxc-cli not available"))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'PASSONE\\nPASSONE\\n' | keepassxc-cli db-create -q "
+                                  (shell-quote-argument db1) " --set-password"))
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'PASSONE\\n' | keepassxc-cli add -q "
+                                  (shell-quote-argument db1)
+                                  " smtp -u me@one --url smtp.one.example"))
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'PASSTWO\\nPASSTWO\\n' | keepassxc-cli db-create -q "
+                                  (shell-quote-argument db2) " --set-password"))
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'PASSTWO\\n' | keepassxc-cli add -q "
+                                  (shell-quote-argument db2)
+                                  " smtp -u me@two --url smtp.two.example")))
+          (should (file-exists-p db1))
+          (should (file-exists-p db2))
+          (let ((password-cache-expiry nil))
+            (password-cache-add db1 "PASSONE")
+            (password-cache-add db2 "PASSTWO")
+            (let* ((r1 (auth-source-search :host "smtp.one.example" :user "me@one"
+                                           :port "465" :require '(:secret)))
+                   (r2 (auth-source-search :host "smtp.two.example" :user "me@two"
+                                           :port "465" :require '(:secret))))
+              (should (= 1 (length r1)))
+              (should (equal "me@one" (plist-get (car r1) :user)))
+              (should (= 1 (length r2)))
+              (should (equal "me@two" (plist-get (car r2) :user)))))
+          (should (equal "PASSONE" (password-read-from-cache db1)))
+          (should (equal "PASSTWO" (password-read-from-cache db2))))
+      (ignore-errors (delete-file db1))
+      (ignore-errors (delete-file db2)))))
+
+(ert-deftest keepass-auth-source-keyfile-honoured ()
+  "A database secured by both a master password and a key file is found
+when the auth-sources entry lists the key file.  The password may come
+from a string or from a function in the spec."
+  (let* ((keepass-auth-source-cache-expiry nil)
+        (keepass-auth-source--active-cli 'keepassxc)
+        (dir (make-temp-file "kpa-kf-" t))
+        (db (concat (file-name-as-directory (make-temp-file "kf-db-" t)) "db.kdbx"))
+        (keyfile (concat (file-name-as-directory dir) "key.txt")))
+    (unless (executable-find "keepassxc-cli")
+      (ert-skip "keepassxc-cli not available"))
+    (with-temp-file keyfile (insert "STANDARD-KEY-FILE-SECRET"))
+    (add-hook 'auth-source-backend-parser-functions
+              #'keepass-auth-source-backend-parser)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            ;; Create a DB that requires both the key file and the password.
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'KEYPW\\nKEYPW\\n' | keepassxc-cli db-create -q "
+                                  (shell-quote-argument db)
+                                  " --set-key-file " (shell-quote-argument keyfile)
+                                  " --set-password"))
+            (call-process "sh" nil t nil "-c"
+                          (concat "printf 'KEYPW\\n' | keepassxc-cli add -q "
+                                  "--key-file " (shell-quote-argument keyfile) " "
+                                  (shell-quote-argument db)
+                                  " kf -u me@kf --url kf.example")))
+          (should (file-exists-p db))
+          (let ((password-cache-expiry nil))
+            ;; Password as a string in the spec: no user prompt, key file
+            ;; passed on every CLI call.
+            (let ((auth-sources (list (list db keyfile "KEYPW"))))
+              (let ((res (auth-source-search :host "kf.example" :user "me@kf"
+                                             :port "465" :require '(:secret))))
+                (should (= 1 (length res)))
+                (should (equal "me@kf" (plist-get (car res) :user)))
+                (should (stringp (funcall (plist-get (car res) :secret))))))
+            ;; Password as a function; same search still works.
+            (let ((auth-sources (list (list db keyfile (lambda () "KEYPW")))))
+              (let ((res (auth-source-search :host "kf.example" :user "me@kf"
+                                             :port "465" :require '(:secret))))
+                (should (= 1 (length res))))))
+          ;; A wrong key file means keepassxc-cli cannot open the DB: the failed
+          ;; open is treated as a wrong credential, so the lookup raises
+          ;; `user-error'.  (A distinct host avoids the auth-source success
+          ;; cache from the earlier searches masking the failure.)
+          (let ((auth-sources (list (list db "/nonexistent-key.txt" "KEYPW"))))
+            (let ((password-cache-expiry nil))
+              (should-error (auth-source-search :host "other.example" :user "me@kf"
+                                                :port "465" :require '(:secret))
+                            :type 'user-error))))
+      (ignore-errors (delete-file db))
+      (ignore-errors (delete-file keyfile))
+      (ignore-errors (delete-directory dir)))))
 
 (provide 'keepass-auth-source-test)
 ;;; keepass-auth-source-test.el ends here

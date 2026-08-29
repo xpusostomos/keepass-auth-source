@@ -35,11 +35,19 @@
 ;; yet create them).
 ;;
 ;; Two entry points:
-;;   - `keepass-browse'            open the listing buffer (Embark works here)
-;;   - `keepass-browse-select'     pick through the minibuffer (consult/vertico)
+;;   - `keepass-browse'            pick an entry through the minibuffer
+;;     (consult/vertico), then act on it (RET and `C-.' both lead to the
+;;     action menu)
+;;   - `keepass-browse-buffer'     a columned listing buffer (Embark works
+;;     on the entry at point)
 ;;
-;; The same actions are available from the Embark action map
-;; `keepass-browse-action-map' and as interactive commands.
+;; The same actions are available from the Embark action maps
+;; (`keepass-browse-action-map' and `keepass-browse-select-action-map') and
+;; as interactive commands.
+;;
+;; This package builds on `keepass-auth-source' (same package): the shared
+;; keepassxc-cli execution, master-password prompting/caching, error
+;; reporting and the `keepass-auth-source-verbose' flag live there.
 
 ;;; Code:
 
@@ -47,6 +55,7 @@
 (require 'consult)
 (require 'embark)
 (require 'embark-consult)
+(require 'keepass-auth-source)
 (require 'password-cache)
 (require 'subr-x)
 
@@ -55,15 +64,50 @@
   :group 'tools
   :prefix "keepass-browse-")
 
-(defcustom keepass-browse-binary "keepassxc-cli"
-  "The keepassxc-cli executable (or path to it)."
-  :type 'string
+(defcustom keepass-browse-databases nil
+  "List of KeePass databases available for browsing.
+Each element is a cons cell (NAME . SPEC), where NAME is a user-visible
+label shown by `keepass-browse-select-database', and SPEC is a database
+specification for `keepass-auth-source' -- a file name (string) or a list
+\\(PATH [KEYFILE] [PASSWORD]).  See `keepass-auth-source--normalize-db'."
+  :type '(repeat (cons (string :tag "Name")
+                       (choice (file :tag "Database file")
+                               (list :tag "Database spec"
+                                     (file :tag "Path")
+                                     (choice (const :tag "No key file" nil)
+                                             (file :tag "Key file")
+                                             function)
+                                     (choice (const :tag "Prompt" nil)
+                                             (string :tag "Password")
+                                             function)))))
   :group 'keepass-browse)
 
-(defcustom keepass-browse-database-file nil
-  "Path of the KeePass database file to operate on."
-  :type '(choice (const :tag "None" nil) file)
+(defcustom keepass-browse-database nil
+  "The currently active KeePass database specification.
+Either a database file name (string), or a list \\(PATH [KEYFILE]
+[PASSWORD]) as understood by `keepass-auth-source'.  Set interactively
+with `keepass-browse-select-database'.  See
+`keepass-auth-source--normalize-db'."
+  :type '(choice (const :tag "None" nil)
+                 (file :tag "Database file")
+                 (list :tag "Database spec"
+                       (file :tag "Path")
+                       (choice (const :tag "No key file" nil)
+                               (file :tag "Key file")
+                               function)
+                       (choice (const :tag "Prompt" nil)
+                               (string :tag "Password")
+                               function)))
   :group 'keepass-browse)
+
+;; If the database *list* is re-set, any previously selected database may
+;; point at something stale (a fixed/removed entry), and
+;; `keepass-browse--ensure-database' would keep using it because it only
+;; acts when `keepass-browse-database' is nil.  Reset it so the user is
+;; prompted to re-select.
+(add-variable-watcher 'keepass-browse-databases
+                      (lambda (_sym _newval _op _where)
+                        (setq keepass-browse-database nil)))
 
 (defcustom keepass-browse-cache-expiry 7200
   "How many seconds to cache the database master password.  Nil disables."
@@ -85,11 +129,6 @@ Each must be a standard KeePass field name: \"Title\", \"UserName\",
 (defcustom keepass-browse-clear-clipboard-seconds 0
   "If non-zero, clear the clipboard this many seconds after a copy."
   :type 'integer
-  :group 'keepass-browse)
-
-(defcustom keepass-browse-verbose nil
-  "If non-nil, log keepassxc-cli invocations to *Messages*."
-  :type 'boolean
   :group 'keepass-browse)
 
 (defcustom keepass-browse-default-action #'keepass-browse-view
@@ -124,10 +163,6 @@ password, i.e. a stored two-factor code; see `keepass-browse-copy-totp'.)")
 
 ;;; Internal state
 
-(defvar keepass-browse--entries nil
-  "Alist of (PATH . FIELDS) for the current database.
-FIELDS is an alist of \"Field\" . value parsed from `show'.")
-
 (defvar keepass-browse--last-killed nil
   "The last string copied, so clearing only happens if it is unchanged.")
 
@@ -138,70 +173,57 @@ FIELDS is an alist of \"Field\" . value parsed from `show'.")
   "History for `keepass-browse-select'.")
 
 ;;; Subprocess plumbing
+;;
+;; All keepassxc-cli execution and master-password prompting is shared with
+;; `keepass-auth-source' (which this package requires); the wrappers below
+;; adapt it to the database configured for browsing.  See
+;; `keepass-auth-source--keepassxc-run' et al.
 
-(defun keepass-browse--executable ()
-  "Return the keepassxc-cli path, else its configured name."
-  (or (executable-find keepass-browse-binary)
-      keepass-browse-binary))
+(defun keepass-browse--db-spec ()
+  "Return the active database spec, signalling an error if none is set."
+  (unless keepass-browse-database
+    (user-error "No KeePass database selected; run `keepass-browse-select-database' first"))
+  keepass-browse-database)
+
+(defun keepass-browse--database-path ()
+  "Return the active database's expanded file path.
+The first element of the active database's spec, expanded so a leading
+\"~\" works; `file-exists-p' accepts \"~\" but keepassxc-cli does not."
+  (let ((spec (keepass-browse--db-spec)))
+    (expand-file-name (car (keepass-auth-source--normalize-db spec)))))
+
+(defun keepass-browse--db-keyfile ()
+  "Return the active database's key file argument list, or nil.
+A list (\"--key-file\" FILE), ready to splice into a keepassxc-cli
+invocation."
+  (let ((spec (keepass-browse--db-spec)))
+    (keepass-auth-source--keyfile-args
+     (nth 1 (keepass-auth-source--normalize-db spec)))))
+
+(defun keepass-browse--db-password ()
+  "Return the active database's master password, per its spec.
+A string or function in the spec is used as-is; nil prompts the user via
+`password-cache' (keyed by the database path), honoring
+`keepass-browse-cache-expiry'."
+  (let ((db (keepass-browse--database-path))
+        (password-spec (nth 2 (keepass-auth-source--normalize-db
+                               keepass-browse-database))))
+    (keepass-auth-source--resolve-password
+     password-spec db keepass-browse-cache-expiry)))
 
 (defun keepass-browse--read-password ()
-  "Return the database master password, prompting and caching it."
-  (let* ((key keepass-browse-database-file)
-         (prompt (format "Master password for %s: " key))
-         (password-cache-expiry keepass-browse-cache-expiry)
-         (password (cond
-                    ((password-read-from-cache key))
-                    ((password-read prompt key)))))
-    (password-cache-add key password)
-    password))
-
-(defun keepass-browse--run (password &rest args)
-  "Run keepassxc-cli ARGS feeding PASSWORD on standard input.
-Returns (OUTPUT . EXIT)."
-  (let* ((prog (keepass-browse--executable))
-         (out (generate-new-buffer " *keepass-browse-out*")))
-    (unwind-protect
-        (with-temp-buffer
-          (when keepass-browse-verbose
-            (let ((display (mapconcat #'shell-quote-argument args " ")))
-              (message "keepassxc-cli %s" display)))
-          (insert (or password "") "\n")
-          (let ((exit (apply #'call-process-region
-                             (point-min) (point-max)
-                             prog t (list out) nil args)))
-            (cons (with-current-buffer out (buffer-string)) exit)))
-      (kill-buffer out))))
-
-(defun keepass-browse--run-stdin (stdin &rest args)
-  "Run keepassxc-cli ARGS feeding STDIN (a string) on standard input.
-Returns (OUTPUT . EXIT)."
-  (let* ((prog (keepass-browse--executable))
-         (out (generate-new-buffer " *keepass-browse-out*")))
-    (unwind-protect
-        (with-temp-buffer
-          (when keepass-browse-verbose
-            (message "keepassxc-cli %s" (mapconcat #'shell-quote-argument args " ")))
-          (insert stdin)
-          (let ((exit (apply #'call-process-region
-                             (point-min) (point-max)
-                             prog t (list out) nil args)))
-            (cons (with-current-buffer out (buffer-string)) exit)))
-      (kill-buffer out))))
+  "Return the browsing database's master password, prompting and caching it.
+Deprecated alias kept for call-site clarity; use `keepass-browse--db-password'."
+  (keepass-browse--db-password))
 
 (defun keepass-browse--error (output)
   "Signal an error describing a failed keepassxc-cli run (OUTPUT)."
-  (let ((msg (string-trim output)))
-    (cond
-     ((string-match-p "Invalid credentials were provided" msg)
-      (password-cache-remove keepass-browse-database-file)
-      (user-error "Incorrect master password"))
-     (t (user-error "keepassxc-cli failed: %s"
-                    (if (> (length msg) 0) msg "unknown error"))))))
+  (keepass-auth-source--error output (keepass-browse--database-path)))
 
 (defun keepass-browse--require-db ()
-  "Signal an error unless a database file is configured."
-  (unless keepass-browse-database-file
-    (user-error "Set `keepass-browse-database-file' first")))
+  "Signal an error unless a database is configured.
+Also applies the default-to-sole-database rule."
+  (keepass-browse--ensure-database))
 
 ;;; Listing and parsing
 
@@ -222,19 +244,21 @@ Returns (OUTPUT . EXIT)."
 
 (defun keepass-browse--entry-get (path)
   "Return the FIELD . VALUE alist for the entry at PATH.
-PATH may be the clean path or the padded display string an action receives
-from Embark; it is resolved through `keepass-browse--path-of' first, so the
-lookup is robust.  Loads the cache if needed, so lookups never run a fragile
-one-off `show' (which could prompt or fail in the minibuffer/Embark)."
-  (keepass-browse--load-entries)
-  ;; Try the direct path first; only resolve a padded display string (as
-  ;; Embark may hand over) when the direct lookup fails.
-  (unless (assoc path keepass-browse--entries)
-    (setq path (keepass-browse--path-of path)))
-  (let ((cached (assoc path keepass-browse--entries)))
-    (if cached
-        (cdr cached)
-      (user-error "No entry for path %s" path))))
+PATH is normally the clean entry path.  If it is a padded display string
+(which an Embark action may hand over), it is resolved through
+`keepass-browse--path-of' first.  Fetches directly from keepassxc-cli with
+no caching, so database changes made elsewhere (e.g. Google Drive sync) are
+always seen."
+  (setq path (or (keepass-browse--path-of path) path))
+  (let* ((db (keepass-browse--database-path))
+         (run (apply #'keepass-auth-source--keepassxc-run
+                     (keepass-browse--db-password)
+                     (append (list "show" "--quiet" "--show-protected")
+                             (keepass-browse--db-keyfile)
+                             (list db path)))))
+    (if (eq (cdr run) 0)
+        (keepass-browse--parse-show (car run))
+      (keepass-browse--error (car run)))))
 
 (defun keepass-browse--field (entry field)
   "Return the value of FIELD in parsed alist ENTRY, or \"\"."
@@ -242,45 +266,46 @@ one-off `show' (which could prompt or fail in the minibuffer/Embark)."
 
 (defun keepass-browse--entry-paths ()
   "Return the list of entry paths (excluding group rows) in the database.
-Derives from the cached export when loaded, else a single `ls' call."
-  (if keepass-browse--entries
-      (mapcar #'car keepass-browse--entries)
-    (let ((run (keepass-browse--run (keepass-browse--read-password)
-                                    "ls" "-q" "-R" "-f"
-                                    keepass-browse-database-file)))
-      (unless (eq (cdr run) 0)
-        (keepass-browse--error (car run)))
-      (let ((paths (seq-filter (lambda (s)
-                                 (and (not (string-blank-p s))
-                                      (not (string-suffix-p "/" s))))
-                               (split-string (car run) "\n" t))))
-        (mapcar (lambda (p) (if (string-prefix-p "/" p) p (concat "/" p)))
-                paths)))))
+Reads freshly from keepassxc-cli, with no caching."
+  (let* ((db (keepass-browse--database-path))
+         (run (apply #'keepass-auth-source--keepassxc-run
+                     (keepass-browse--db-password)
+                     (append (list "ls" "--quiet" "--recursive" "--flatten")
+                             (keepass-browse--db-keyfile)
+                             (list db)))))
+    (unless (eq (cdr run) 0)
+      (keepass-browse--error (car run)))
+    (let ((paths (seq-filter (lambda (s)
+                               (and (not (string-blank-p s))
+                                    (not (string-suffix-p "/" s))))
+                             (split-string (car run) "\n" t))))
+      (mapcar (lambda (p) (if (string-prefix-p "/" p) p (concat "/" p)))
+              paths))))
 
 (defun keepass-browse--group-paths ()
   "Return the list of group paths (each ending in /) in the database.
-Derives from the cached export when loaded, else a single `ls' call."
-  (if keepass-browse--entries
-      (let (groups)
-        (dolist (e keepass-browse--entries (nreverse groups))
-          (let ((dir (file-name-directory (car e))))
-            (when (and dir (not (member dir groups)))
-              (push dir groups)))))
-    (let ((run (keepass-browse--run (keepass-browse--read-password)
-                                    "ls" "-q" "-R" "-f"
-                                    keepass-browse-database-file)))
-      (unless (eq (cdr run) 0)
-        (keepass-browse--error (car run)))
-      (mapcar (lambda (g) (if (string-prefix-p "/" g) g (concat "/" g)))
-              (seq-filter (lambda (s) (string-suffix-p "/" s))
-                          (split-string (car run) "\n" t))))))
+Reads freshly from keepassxc-cli, with no caching."
+  (let* ((db (keepass-browse--database-path))
+         (run (apply #'keepass-auth-source--keepassxc-run
+                     (keepass-browse--db-password)
+                     (append (list "ls" "--quiet" "--recursive" "--flatten")
+                             (keepass-browse--db-keyfile)
+                             (list db)))))
+    (unless (eq (cdr run) 0)
+      (keepass-browse--error (car run)))
+    (mapcar (lambda (g) (if (string-prefix-p "/" g) g (concat "/" g)))
+            (seq-filter (lambda (s) (string-suffix-p "/" s))
+                        (split-string (car run) "\n" t)))))
 
 (defun keepass-browse--export ()
   "Return the export XML node tree for the database.
 Does ONE `keepassxc-cli export' call so the whole database (all entries,
-all fields, passwords included) is fetched up front."
-  (let ((run (keepass-browse--run (keepass-browse--read-password)
-                                  "export" "-q" keepass-browse-database-file)))
+all fields, passwords included) is fetched up front, freshly each time."
+  (let ((run (apply #'keepass-auth-source--keepassxc-run
+                    (keepass-browse--db-password)
+                    (append (list "export" "--quiet")
+                            (keepass-browse--db-keyfile)
+                            (list (keepass-browse--database-path))))))
     (unless (eq (cdr run) 0)
       (keepass-browse--error (car run)))
     (with-temp-buffer
@@ -333,23 +358,20 @@ groups' names are."
                          acc))))
     acc))
 
-(defun keepass-browse--load-entries (&optional force)
-  "Load all entries into `keepass-browse--entries' via ONE export call.
-FORCE reloads.  Populates the cache as (PATH . FIELDS) pairs, so listing
-and actions never invoke keepassxc-cli again for data already in memory."
-  (when (or force (not keepass-browse--entries))
-    (let* ((tree (keepass-browse--export))
-           (root (car (keepass-browse--xml-children-tag tree 'Root)))
-           (entries '()))
-      (dolist (g (keepass-browse--xml-children-tag root 'Group))
-        (setq entries (append entries (keepass-browse--collect g ""))))
-      ;; `keepassxc-cli rm' moves deleted entries to the Recycle Bin; exclude
-      ;; them so a rename (add-new + delete-old) does not show a duplicate.
-      (setq keepass-browse--entries
-            (seq-filter (lambda (e)
-                          (not (string-prefix-p "/Recycle Bin/" (car e))))
-                        entries))))
-  keepass-browse--entries)
+(defun keepass-browse--load-entries ()
+  "Return ((PATH . FIELDS) ...) for the whole database, freshly.
+Does ONE export call and discards the result, so no entries are cached
+behind the scenes; database changes made elsewhere are always visible."
+  (let* ((tree (keepass-browse--export))
+         (root (car (keepass-browse--xml-children-tag tree 'Root)))
+         (entries '()))
+    (dolist (g (keepass-browse--xml-children-tag root 'Group))
+      (setq entries (append entries (keepass-browse--collect g ""))))
+    ;; `keepassxc-cli rm' moves deleted entries to the Recycle Bin; exclude
+    ;; them so a rename (add-new + delete-old) does not show a duplicate.
+    (seq-filter (lambda (e)
+                  (not (string-prefix-p "/Recycle Bin/" (car e))))
+                entries)))
 
 ;;; Candidates
 
@@ -399,12 +421,12 @@ that merely looks similar cannot resolve to the wrong entry."
 
 (defun keepass-browse--totp (path)
   "Return the current TOTP for the entry at PATH, or nil."
-  (keepass-browse--load-entries)
-  (unless (assoc path keepass-browse--entries)
-    (setq path (keepass-browse--path-of path))) ; resolve padded Embark target
-  (let ((run (keepass-browse--run (keepass-browse--read-password)
-                                  "show" "-q" "--totp"
-                                  keepass-browse-database-file path)))
+  (setq path (or (keepass-browse--path-of path) path)) ; resolve padded target
+  (let ((run (apply #'keepass-auth-source--keepassxc-run
+                    (keepass-browse--db-password)
+                    (append (list "show" "--quiet" "--totp")
+                            (keepass-browse--db-keyfile)
+                            (list (keepass-browse--database-path) path)))))
     (when (eq (cdr run) 0)
       (string-trim (car run)))))
 
@@ -515,6 +537,14 @@ menu is only shown when already viewing an entry."
               rows)))
     (concat "\n\n" (string-join (nreverse rows) "\n"))))
 
+(defun keepass-browse--database-name ()
+  "Return the user-visible name of the active database, or nil.
+The name is the `car' of the (NAME . SPEC) entry in
+`keepass-browse-databases' whose spec is the active one.  Returns nil when
+the databases list is empty or when the active spec has no matching entry."
+  (let ((spec keepass-browse-database))
+    (car (cl-find spec keepass-browse-databases :key #'cdr :test #'equal))))
+
 (defun keepass-browse-view-update (reveal)
   "Redraw the current view buffer, revealing the password when REVEAL.
 The password appears once, on its own line after the username.  It is hidden
@@ -527,6 +557,10 @@ which case there is nothing to hide."
                "[hidden - press r]")))
     (let ((inhibit-read-only t))
       (erase-buffer)
+      ;; Show which database this entry came from when several are configured.
+      (when (> (length keepass-browse-databases) 1)
+        (insert (format "%-10s %s\n" "Database"
+                        (or (keepass-browse--database-name) "(unknown)"))))
       (dolist (f '("Title" "UserName"))
         (insert (format "%-10s %s\n" f (keepass-browse--field entry f))))
       (insert (format "%-10s %s\n" "Password" pw))
@@ -588,7 +622,6 @@ NEW-PATH, when given, re-points the view at the entry's new path (after a
 rename).  Does nothing if no view buffer is open."
   (let ((buf (get-buffer "*keepass-browse-view*")))
     (when buf
-      (keepass-browse--load-entries t) ; force re-export of the database
       (with-current-buffer buf
         (when new-path
           (setq-local keepass-browse-view-path new-path))
@@ -628,7 +661,7 @@ rename).  Does nothing if no view buffer is open."
   (interactive)
   (when (re-search-forward "^Password: " nil t)
     (let ((len (read-number "Password length: " 16)))
-      (let ((run (keepass-browse--run "" "generate" "-L" (format "%d" len))))
+      (let ((run (keepass-auth-source--keepassxc-run "" "generate" "-L" (format "%d" len))))
         (if (eq (cdr run) 0)
             (progn
               (delete-region (point) (line-end-position))
@@ -725,11 +758,13 @@ so editing does not become a spurious add/delete."
   ;; are used as-is.
   (unless (string-prefix-p "/" (or path ""))
     (setq path (keepass-browse--path-of path)))
-  (let ((run (keepass-browse--run (keepass-browse--read-password)
-                                  "rm" "-q" keepass-browse-database-file path)))
+  (let ((run (apply #'keepass-auth-source--keepassxc-run
+                    (keepass-browse--db-password)
+                    (append (list "rm" "--quiet")
+                            (keepass-browse--db-keyfile)
+                            (list (keepass-browse--database-path) path)))))
     (if (eq (cdr run) 0)
         (progn
-          (setq keepass-browse--entries nil) ; invalidate cache
           ;; If the deleted entry is displayed in the view buffer, close it --
           ;; its path no longer exists, so it could only show stale data.
           (let ((view (get-buffer "*keepass-browse-view*")))
@@ -766,25 +801,30 @@ duplicate.  A new entry uses `keepassxc-cli add'."
                                 (if (string-prefix-p "/" title) title title))))))
     (when (string-empty-p title)
       (user-error "Title may not be empty"))
-    (let* ((stdin (concat (keepass-browse--read-password) "\n"
+    (let* ((stdin (concat (keepass-browse--db-password) "\n"
                           password "\n"))
            (cli (if (string= action "edit") "edit" "add"))
            ;; `-t' (title) exists only on `edit'; for `add' the title is part
-           ;; of the entry path and is not passed separately.
-           (common (list "-u" (keepass-browse--field entry "UserName")
-                         "--url" (keepass-browse--field entry "URL")
-                         "--notes" (keepass-browse--field entry "Notes")
-                         "-p"))
+           ;; of the entry path and is not passed separately.  Global options
+           ;; (`--key-file') come after the subcommand and before the
+           ;; positional database argument.
+           (db (keepass-browse--database-path))
+           (common (append (list "-u" (keepass-browse--field entry "UserName")
+                                 "--url" (keepass-browse--field entry "URL")
+                                 "--notes" (keepass-browse--field entry "Notes")
+                                 "-p")))
            (args (if (string= action "edit")
-                     (append (list cli keepass-browse-database-file path
-                                   "-t" title)
+                     (append (list cli)
+                             (keepass-browse--db-keyfile)
+                             (list db path "-t" title)
                              common)
-                   (append (list cli keepass-browse-database-file path)
+                   (append (list cli)
+                           (keepass-browse--db-keyfile)
+                           (list db path)
                            common))))
-      (let ((run (apply #'keepass-browse--run-stdin stdin args)))
+      (let ((run (apply #'keepass-auth-source--keepassxc-run-stdin stdin args)))
         (if (eq (cdr run) 0)
             (progn
-              (setq keepass-browse--entries nil) ; invalidate cache
               ;; Re-point and redraw the view buffer at the entry as it now
               ;; exists: for an edit it may have been renamed via -t; for a
               ;; clone it is the newly created copy.
@@ -928,7 +968,7 @@ A command wrapper so RET in the action map can invoke whatever function
   "Reload the entry list from the database and redisplay."
   (interactive)
   (let ((buf (current-buffer)))
-    (keepass-browse--load-entries t)
+    (keepass-browse--load-entries)
     (with-current-buffer buf
       (keepass-browse--insert-list))))
 
@@ -967,6 +1007,59 @@ actions (copy username/password, edit, ...).  Returns the chosen path."
           (when keepass-browse-default-action
             (funcall keepass-browse-default-action path))
           path)))))
+
+(defun keepass-browse--check-databases ()
+  "Signal a clear error if `keepass-browse-databases' has the wrong shape.
+Each element must be a cons cell (NAME . SPEC): NAME is a string label and
+SPEC is a database file name or a (PATH [KEYFILE] [PASSWORD]) list."
+  (unless (listp keepass-browse-databases)
+    (user-error "`keepass-browse-databases' must be a list of (NAME . SPEC) \
+conses, got %S" keepass-browse-databases))
+  (dolist (entry keepass-browse-databases)
+    (unless (and (consp entry)
+                 (stringp (car entry)))
+      (user-error "Each element of `keepass-browse-databases' must be a \
+(NAME . SPEC) cons; got %S" entry))))
+
+(defun keepass-browse--ensure-database ()
+  "Make sure a database is selected.
+If `keepass-browse-database' is already set, leave it.  Otherwise, if
+`keepass-browse-databases' has exactly one entry, select it automatically;
+if it has several and the user has not picked one yet, prompt them with
+`keepass-browse-select-database'."
+  (keepass-browse--check-databases)
+  (unless keepass-browse-database
+    (if (= 1 (length keepass-browse-databases))
+        (setq keepass-browse-database (cdar keepass-browse-databases))
+      (keepass-browse-select-database)))
+  keepass-browse-database)
+
+;;;###autoload
+(defun keepass-browse-select-database ()
+  "Select the active KeePass database from `keepass-browse-databases'."
+  (interactive)
+  (keepass-browse--check-databases)
+  (unless keepass-browse-databases
+    (user-error "`keepass-browse-databases' is empty -- add your databases first"))
+  (let* ((names (mapcar #'car keepass-browse-databases))
+         (chosen (completing-read "KeePass database: " names nil t)))
+    (setq keepass-browse-database
+          (cdr (assoc chosen keepass-browse-databases)))
+    (message "Using KeePass database %s" chosen)
+    keepass-browse-database))
+
+;;;###autoload
+(defun keepass-browse-add-databases-to-auth-sources ()
+  "Add every database spec in `keepass-browse-databases' to `auth-sources'.
+Each entry's SPEC (the `cdr' of the (NAME . SPEC) cons) is appended to
+`auth-sources' so `keepass-auth-source' can search all of them.  Call
+after setting `keepass-browse-databases' and before/after
+`keepass-auth-source-enable'."
+  (interactive)
+  (dolist (entry keepass-browse-databases)
+    (let ((spec (cdr entry)))
+      (unless (member spec auth-sources)
+        (setq auth-sources (append auth-sources (list spec)))))))
 
 (provide 'keepass-browse)
 ;;; keepass-browse.el ends here
