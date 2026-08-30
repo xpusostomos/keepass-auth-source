@@ -73,13 +73,137 @@
     (should-not (assoc "Uuid" entry))))
 
 (ert-deftest keepass-browse-parse-entry-buffer ()
-  "`parse-entry' reads Field: value lines."
+  "`parse-entry' reads Field: value lines, including the optional Group."
   (with-temp-buffer
-    (insert "Title: /g/t\nUserName: bob\nPassword: pw\nURL: http://x\n")
+    (insert "Group: /g/\nTitle: /g/t\nUserName: bob\nPassword: pw\nURL: http://x\n")
     (let ((entry (keepass-browse--parse-entry)))
+      (should (equal "/g/" (cdr (assoc "Group" entry))))
       (should (equal "/g/t" (cdr (assoc "Title" entry))))
       (should (equal "bob" (cdr (assoc "UserName" entry))))
       (should (equal "pw" (cdr (assoc "Password" entry)))))))
+
+(ert-deftest keepass-browse-parse-entry-group-absent ()
+  "A buffer without a Group line still parses; Group is optional."
+  (with-temp-buffer
+    (insert "Title: t\nUserName: u\nPassword: p\nURL: http://x\n")
+    (let ((entry (keepass-browse--parse-entry)))
+      (should-not (assoc "Group" entry))
+      (should (equal "t" (cdr (assoc "Title" entry)))))))
+
+(ert-deftest keepass-browse-edit-includes-group-line ()
+  "`keepass-browse-edit' templates the Group line above Title."
+  (let ((entry '(("Title" . "t") ("UserName" . "u") ("Password" . "p")
+                 ("URL" . "x") ("Notes" . "n")))
+        (box (list nil)))
+    ;; Stub entry-get and entry-open to capture the template.
+    (cl-letf (((symbol-function 'keepass-browse--entry-get) (lambda (_) entry))
+              ((symbol-function 'keepass-browse--entry-open)
+               (lambda (_name _action _path template)
+                 (setcar box template))))
+      (keepass-browse-edit "/g/t"))
+    (should (string-match-p "^Group: /g/\n" (car box)))
+    (should (string-match-p "\nTitle: t\n" (car box)))))
+
+(ert-deftest keepass-browse-parse-entry-ignores-hint-line ()
+  "The `;; Keys:' hint line is not parsed into an entry field."
+  (with-temp-buffer
+    (insert ";; Keys: C-c C-c commit | C-c C-p select group | C-c C-r regenerate\n"
+            ";; C-c C-k cancel\n"
+            "Group: /Work/\nTitle: t\nUserName: u\nPassword: p\n")
+    (let ((entry (keepass-browse--parse-entry)))
+      (should-not (assoc "Keys" entry))
+      (should (equal "/Work/" (cdr (assoc "Group" entry))))
+      (should (equal "t" (cdr (assoc "Title" entry))))
+      (should (equal "u" (cdr (assoc "UserName" entry)))))))
+
+(ert-deftest keepass-browse-entry-mode-map-bindings ()
+  "The entry-mode keymap binds group-choosing to `C-c C-p'.
+Not `C-c C-g': a C-g after a prefix key is treated by Emacs as \"cancel
+the prefix\" and can never be dispatched to a binding."
+  (should (eq #'keepass-browse--entry-choose-group
+              (lookup-key keepass-browse-entry-mode-map (kbd "C-c C-p"))))
+  (should (eq #'keepass-browse--entry-commit
+              (lookup-key keepass-browse-entry-mode-map (kbd "C-c C-c"))))
+  ;; Guard against reintroducing the C-g trap.
+  (should-not (lookup-key keepass-browse-entry-mode-map (kbd "C-c C-g"))))
+
+(ert-deftest keepass-browse-entry-open-unmodified ()
+  "A freshly opened entry buffer is not marked modified until edited."
+  (let ((buf (cl-letf (((symbol-function 'switch-to-buffer) #'ignore))
+               (keepass-browse--entry-open "*kb-open-test*" "add" nil))))
+    (should-not (buffer-modified-p buf))
+    (with-current-buffer buf
+      (insert "x"))
+    (should (buffer-modified-p buf))
+    (kill-buffer buf)))
+
+(ert-deftest keepass-browse-view-shows-group ()
+  "The view buffer shows a Group line (the entry's folder) above Title."
+  (with-temp-buffer
+    (setq-local keepass-browse-view-path "/Internet/Google/mail")
+    (cl-letf (((symbol-function 'keepass-browse--entry-get)
+               (lambda (_) '(("Title" . "mail") ("UserName" . "u")
+                             ("Password" . "p") ("URL" . "x")
+                             ("Notes" . "n")))))
+      (keepass-browse-view-update nil))
+    (goto-char (point-min))
+    (should (string-match-p "^Group\\s-+/Internet/Google/\n" (buffer-string)))
+    (should (string-match-p "^Group\\s-+.+\nTitle\\s-+mail\n" (buffer-string)))))
+
+(ert-deftest keepass-browse-generate-args ()
+  "The option labels expand into full keepassxc-cli commands.
+The `:length' placeholder is replaced by the requested length as a string
+(since `call-process' takes only strings)."
+  (should (equal '("generate" "--upper" "--length" "16")
+                 (keepass-browse--generate-args "upper case" 16)))
+  (should (equal '("generate" "--lower" "--upper" "--numeric" "--length" "12")
+                 (keepass-browse--generate-args "with numeric" 12)))
+  ;; The all-printable set is the full !-~ range via --custom.
+  (let ((ascii (keepass-browse--generate-args "all printable (!-~)" 8)))
+    (should (equal '("generate" "--custom") (seq-take ascii 2)))
+    (let* ((set (nth 2 ascii)))
+      (should (= 94 (length set)))                 ; ! (0x21) .. ~ (0x7e)
+      (should (string-match-p "!" set))
+      (should (string-match-p "~" set))
+      (should-not (string-match-p " " set))))      ; 0x20 is outside the range
+  ;; The diceware option uses --words, not --length.
+  (should (equal '("diceware" "--words" "6")
+                 (keepass-browse--generate-args "passphrase" 6)))
+  ;; A label not in the alist is an error.
+  (should-error (keepass-browse--generate-args "bogus" 8)))
+
+(ert-deftest keepass-browse-generate-failure-message ()
+  "The keepassxc 'Invalid password generator' error advises a longer length."
+  (let ((msg (keepass-browse--generate-failure-message
+              "with special"
+              "Invalid password generator after applying all options.")))
+    (should (string-match-p "longer length" msg))
+    (should (string-match-p "with special" msg)))
+  ;; Other failures keep a generic message.
+  (should (string-match-p "failed"
+                          (keepass-browse--generate-failure-message
+                           "with special" "some other error"))))
+
+(ert-deftest keepass-browse-read-charset-remembers ()
+  "`read-charset' offers the last choice as default, else the first option."
+  (let ((keepass-browse--last-generated-charset "mixed case"))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_p _c _x _r _h _i def)
+                 (unless (string= def "mixed case")
+                   (ert-fail (format "expected default label, got %S" def)))
+                 "upper case")))
+      (should (equal "upper case" (keepass-browse--read-charset)))
+      (should (equal "upper case"
+                     keepass-browse--last-generated-charset))))
+  ;; Nothing chosen yet -> the first entry's label is the default.
+  (let ((keepass-browse--last-generated-charset nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_p _c _x _r _h _i def)
+                 (unless (string= def "all printable (!-~)")
+                   (ert-fail (format "expected default label, got %S" def)))
+                 def)))
+      (should (equal "all printable (!-~)"
+                     (keepass-browse--read-charset))))))
 
 (ert-deftest keepass-browse-parse-entry-multiline-notes ()
   "Notes extends to the end of the buffer, preserving multiple lines."
@@ -285,6 +409,24 @@ known\").  The pure string helpers must never touch those."
     (let ((paths (keepass-browse--entry-paths)))
       (should (member "/Work/github-new" paths))
       (should-not (member "/Work/github" paths)))))
+
+(ert-deftest keepass-browse-entry-commit-moves-group ()
+  "Changing the Group field moves the entry into another group (mv).
+The move must not delete+re-add: the entry survives in its new group and
+the old path is gone."
+  (keepass-browse-test-with-db
+    (with-temp-buffer
+      (insert "Group: /Work/\nTitle: email\nUserName: me@x.com\nPassword: PASS\nURL: smtp.x.com:465\n")
+      (keepass-browse-entry-mode)
+      (setq-local keepass-browse--entry-action "edit")
+      (setq-local keepass-browse--entry-original "/email")
+      (keepass-browse--entry-commit))
+    (let ((paths (keepass-browse--entry-paths)))
+      (should (member "/Work/email" paths))
+      (should-not (member "/email" paths)))
+    ;; The entry's fields survive the move.
+    (let ((entry (keepass-browse--entry-get "/Work/email")))
+      (should (equal "me@x.com" (cdr (assoc "UserName" entry)))))))
 
 (ert-deftest keepass-browse-delete-removes ()
   "Deleting an entry removes it from the list."

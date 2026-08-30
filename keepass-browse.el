@@ -118,6 +118,37 @@ Each must be a standard KeePass field name: \"Title\", \"UserName\",
   :type 'integer
   :group 'keepass-browse)
 
+(defcustom keepass-browse-generate-length 16
+  "Default length for passwords generated with `keepass-browse--entry-regenerate'.
+The prompted default each time; the last-entered length is remembered for
+the session."
+  :type 'integer
+  :group 'keepass-browse)
+
+(defcustom keepass-browse-generate-options
+  '(("all printable (!-~)"
+     ("generate" "--custom"
+      "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+      "--length" :length))
+    ("upper case"     ("generate" "--upper" "--length" :length))
+    ("lower case"     ("generate" "--lower" "--length" :length))
+    ("mixed case"     ("generate" "--lower" "--upper" "--length" :length))
+    ("with numeric"   ("generate" "--lower" "--upper" "--numeric" "--length" :length))
+    ("with special"   ("generate" "--lower" "--upper" "--numeric" "--special" "--length" :length))
+    ("with extended"  ("generate" "--lower" "--upper" "--numeric" "--special" "--extended" "--length" :length))
+    ("passphrase"     ("diceware" "--words" :length)))
+  "Generation options offered when regenerating a password.
+Each entry is (LABEL ARGS).  LABEL is what the user picks by completion.
+ARGS is the whole keepassxc-cli command -- subcommand first (\"generate\"
+or \"diceware\"), then its flags -- with the symbol `:length' as a
+placeholder for the requested length (generators take \"--length\", the
+diceware passphrase takes \"--words\").  The first entry is the default
+until a choice is remembered.  Add, remove or reorder your own sets here."
+  :type '(repeat (cons (string :tag "Label")
+                       (repeat (choice (string :tag "Arg")
+                                       (const :tag ":length" :length)))))
+  :group 'keepass-browse)
+
 (defcustom keepass-browse-default-action #'keepass-browse-view
   "Function run on the selected entry when `keepass-browse' returns.
 Called with the entry path.  The default, `keepass-browse-view', shows the
@@ -158,6 +189,15 @@ password, i.e. a stored two-factor code; see `keepass-browse-copy-totp'.)")
 
 (defvar keepass-browse-history nil
   "History for `keepass-browse-select'.")
+
+(defvar keepass-browse--last-generated-length nil
+  "Length last used by `keepass-browse--entry-regenerate'.
+Nil until the first generation; thereafter the default offered.")
+
+(defvar keepass-browse--last-generated-charset nil
+  "Label of the character set last used by `keepass-browse--entry-regenerate'.
+A label from `keepass-browse-generate-options'.  Nil until the first
+generation; thereafter the default offered.")
 
 ;; vertico is an optional completion framework (consult works without it);
 ;; these variables only exist once vertico is loaded, hence the `defvar'
@@ -638,6 +678,8 @@ which case there is nothing to hide."
       (when (> (length keepass-browse-databases) 1)
         (insert (format "%-10s %s\n" "Database"
                         (or (keepass-browse--database-name) "(unknown)"))))
+      (insert (format "%-10s %s\n" "Group"
+                      (keepass-browse--entry-directory keepass-browse-view-path)))
       (dolist (f '("Title" "UserName"))
         (insert (format "%-10s %s\n" f (keepass-browse--field entry f))))
       (insert (format "%-10s %s\n" "Password" pw))
@@ -712,19 +754,37 @@ rename).  Does nothing if no view buffer is open."
 (defvar-local keepass-browse--entry-original nil
   "For the entry buffer: the original path being edited, if any.")
 
-(defvar keepass-browse-entry-mode-map
+(defconst keepass-browse-entry-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'keepass-browse--entry-commit)
     (define-key map (kbd "C-c C-k") #'kill-buffer-and-window)
     (define-key map (kbd "C-c C-r") #'keepass-browse--entry-regenerate)
+    ;; Not C-c C-g: a C-g after a prefix key is specially handled by Emacs
+    ;; as "cancel the prefix" and can never be dispatched to a binding.
+    (define-key map (kbd "C-c C-p") #'keepass-browse--entry-choose-group)
     (define-key map (kbd "TAB") #'keepass-browse--entry-next-field)
     map)
   "Keymap for `keepass-browse-entry-mode'.")
 
 (define-minor-mode keepass-browse-entry-mode
-  "Minor mode for editing a KeePass entry as a text buffer."
+  "Minor mode for editing a KeePass entry as a text buffer.
+
+Keys:
+\\<keepass-browse-entry-mode-map>
+\\[keepass-browse--entry-commit]  commit this entry
+\\[keepass-browse--entry-choose-group]  choose the entry's group by completion
+\\[keepass-browse--entry-regenerate]  regenerate the password
+\\[kill-buffer-and-window]  cancel and close
+\\[keepass-browse--entry-next-field]  next field"
   :lighter " Kb-Entry"
   :keymap keepass-browse-entry-mode-map)
+
+(defconst keepass-browse--entry-hint
+  ";; Keys: C-c C-c commit | C-c C-p select group
+;; Keys: C-c C-r regenerate password | C-c C-k cancel"
+  "Comment lines shown at the top of entry buffers.
+They are ignored by `keepass-browse--parse-entry' (which only reads
+recognized `Field: value' lines), so they never reach the database.")
 
 (defun keepass-browse--entry-next-field ()
   "Move to the next \"Field: value\" line."
@@ -733,40 +793,93 @@ rename).  Does nothing if no view buffer is open."
       (goto-char (match-beginning 0))
     (goto-char (point-min))))
 
+(defun keepass-browse--generate-args (label length)
+  "Return the keepassxc-cli command for generation option LABEL.
+LABEL is the label of an entry (LABEL ARGS) in
+`keepass-browse-generate-options'; the returned list is ARGS with every
+`:length' placeholder replaced by LENGTH.  ARGS begins with the
+subcommand (\"generate\" or \"diceware\")."
+  (let ((args (cadr (assoc label keepass-browse-generate-options))))
+    (unless args
+      (user-error "Unknown password generation option: %S" label))
+    ;; `call-process' takes only strings, so the numeric length becomes a
+    ;; string in place of the `:length' placeholder.
+    (mapcar (lambda (a) (if (eq a :length) (number-to-string length) a))
+            args)))
+
+(defun keepass-browse--read-charset ()
+  "Prompt for a password character set, with a nice descriptive label.
+Completes over the labels of `keepass-browse-generate-options',
+defaulting to `keepass-browse--last-generated-charset' when set, else to
+the first entry; remembers the choice for next time.  Returns the label."
+  (let* ((labels (mapcar #'car keepass-browse-generate-options))
+         (default-label (or keepass-browse--last-generated-charset
+                            (car labels)))
+         (chosen (completing-read "Password character set: "
+                                  labels nil t nil nil default-label)))
+    (setq keepass-browse--last-generated-charset chosen)
+    chosen))
+
+(defun keepass-browse--generate-failure-message (charset output)
+  "Return a helpful message for a failed generation with CHARSET and OUTPUT.
+keepassxc-cli reports \"Invalid password generator after applying all
+options\" when the requested length is too short for the chosen character
+classes; this advises a longer length instead of showing the raw error."
+  (if (string-match-p "Invalid password generator" output)
+      (format "Password length is too short for the %S option -- generate again with a longer length"
+              charset)
+    "Could not generate password (keepassxc-cli failed)"))
+
 (defun keepass-browse--entry-regenerate ()
-  "Insert a generated password into the Password line."
+  "Insert a generated password into the Password line.
+Asks for a character set (with a descriptive title, remembering the last
+one chosen) and a length (defaulting to `keepass-browse-generate-length'
+or the last length used)."
   (interactive)
   (when (re-search-forward "^Password: " nil t)
-    (let ((len (read-number "Password length: " 16)))
-      (let ((run (keepass-auth-source--keepassxc-run "" "generate" "-L" (format "%d" len))))
-        (if (eq (cdr run) 0)
-            (progn
-              (delete-region (point) (line-end-position))
-              (insert (string-trim (car run))))
-          (message "could not generate password")))))
+    (let* ((charset (keepass-browse--read-charset))
+           (len (read-number "Password length: "
+                             (or keepass-browse--last-generated-length
+                                 keepass-browse-generate-length)))
+           (run (apply #'keepass-auth-source--keepassxc-run ""
+                       (keepass-browse--generate-args charset len))))
+      (setq keepass-browse--last-generated-length len)
+      (if (eq (cdr run) 0)
+          (progn
+            (delete-region (point) (line-end-position))
+            (insert (string-trim (car run))))
+        (message "%s" (keepass-browse--generate-failure-message
+                       charset (car run))))))
   (goto-char (point-min)))
 
 (defun keepass-browse--entry-open (name action path &optional template)
   "Open an entry buffer NAME for ACTION on PATH (or nil to add).
-TEMPLATE is the initial text; defaults to blank standard fields."
+TEMPLATE is the initial text; defaults to blank standard fields.
+The freshly-inserted template is marked unmodified, so the buffer does
+not look dirty until you actually change something.  Returns the buffer."
   (let ((buf (generate-new-buffer name)))
     (with-current-buffer buf
+      (insert keepass-browse--entry-hint "\n")
       (insert (or template
                   (mapconcat (lambda (f) (format "%s: " f))
-                             '("Title" "UserName" "Password" "URL" "Notes") "\n")))
+                             '("Group" "Title" "UserName" "Password" "URL" "Notes") "\n")))
       (goto-char (point-min))
       (keepass-browse-entry-mode)
       (setq-local keepass-browse--entry-action action)
-      (setq-local keepass-browse--entry-original path))
-    (switch-to-buffer buf)))
+      (setq-local keepass-browse--entry-original path)
+      (set-buffer-modified-p nil))
+    (switch-to-buffer buf)
+    buf))
 
 (defun keepass-browse--parse-entry ()
   "Parse the current entry buffer into a FIELD . VALUE alist.
 Each field is a single line, except Notes, which extends from after
-\"Notes: \" to the end of the buffer, so multi-line notes are preserved."
+\"Notes: \" to the end of the buffer, so multi-line notes are preserved.
+The `Group' field, when present, is the entry's location -- a KeePass
+group path ending in \"/\" -- shown above Title."
   (goto-char (point-min))
   (let ((result '())
-        (keys '("Title" "UserName" "Password" "URL")))
+        (keys '("Group" "Title" "UserName" "Password" "URL")))
     (dolist (key keys)
       (when (re-search-forward (concat "^" key ": ?\\(.*\\)$") nil t)
         (setq result (cons (cons key (match-string 1)) result))))
@@ -796,23 +909,41 @@ group prefix) and the other fields, then commit with
                      (concat "/" (string-trim-left target "/")))
                   (keepass-browse--choose-group))))
     (keepass-browse--entry-open "*keepass-browse-add*" "add" nil
-                                (format "Title: %s\nUserName: \nPassword: \nURL: \nNotes: \n" group))))
+                                (format "Group: %s\nTitle: \nUserName: \nPassword: \nURL: \nNotes: \n" group))))
 
 (defun keepass-browse--choose-group ()
   "Choose a KeePass group path by completion (ends in /)."
   (let ((groups (keepass-browse--group-paths)))
     (completing-read "Group: " groups nil nil nil)))
 
+(defun keepass-browse--entry-choose-group ()
+  "Choose the entry's group by completion, replacing the `Group' line.
+Putting an entry in a group is a rare and error-prone edit, so the safe
+way is to complete over the groups that already exist rather than typing
+the path by hand (a typo would silently aim at a group that does not
+exist).  Bound to `C-c C-p' in `keepass-browse-entry-mode-map'; with
+point in the entry buffer, this replaces the `Group:' line."
+  (interactive)
+  (let ((group (keepass-browse--choose-group)))
+    (goto-char (point-min))
+    (if (re-search-forward "^Group: " nil t)
+        (progn
+          (delete-region (point) (line-end-position))
+          (insert group))
+      (insert (format "Group: %s\n" group)))))
+
 (defun keepass-browse-edit (path)
   "Edit the entry at PATH in an entry buffer.
-The Title line holds the bare entry title; the full path is tracked in
-`keepass-browse--entry-original', and the commit rebuilds the path from it,
-so editing does not become a spurious add/delete."
+The Group line holds the entry's group (the folder it sits in); the
+Title line the bare entry title.  The full path is tracked in
+`keepass-browse--entry-original', and the commit rebuilds the path from
+it, so editing does not become a spurious add/delete."
   (interactive "sEntry path: ")
   (let* ((entry (keepass-browse--entry-get path))
          (title (keepass-browse--entry-basename path)))
     (keepass-browse--entry-open "*keepass-browse-edit*" "edit" path
-                                (format "Title: %s\nUserName: %s\nPassword: %s\nURL: %s\nNotes: %s\n"
+                                (format "Group: %s\nTitle: %s\nUserName: %s\nPassword: %s\nURL: %s\nNotes: %s\n"
+                                        (keepass-browse--entry-directory path)
                                         title
                                         (keepass-browse--field entry "UserName")
                                         (keepass-browse--field entry "Password")
@@ -823,11 +954,13 @@ so editing does not become a spurious add/delete."
   "Clone the entry at PATH into an entry buffer."
   (interactive "sEntry path: ")
   (let ((entry (keepass-browse--entry-get path)))
-    (keepass-browse--entry-open "*keepass-browse-clone*" "add" nil
-                                (mapconcat (lambda (f)
-                                             (format "%s: %s" f (keepass-browse--field entry f)))
-                                           '("Title" "UserName" "Password" "URL" "Notes")
-                                           "\n"))))
+    (keepass-browse--entry-open
+     "*keepass-browse-clone*" "add" nil
+     (concat (format "Group: %s\n" (keepass-browse--entry-directory path))
+             (mapconcat (lambda (f)
+                          (format "%s: %s" f (keepass-browse--field entry f)))
+                        '("Title" "UserName" "Password" "URL" "Notes")
+                        "\n")))))
 
 (defun keepass-browse--delete-entry (path)
   "Delete the entry at PATH without confirmation."
@@ -858,24 +991,26 @@ so editing does not become a spurious add/delete."
 
 (defun keepass-browse--entry-commit ()
   "Commit the add/clone/edit in the current entry buffer.
-An edit uses `keepassxc-cli edit' in place (passing `-t' when the title
-changed), so a rename is not a delete+add and never creates a Recycle-Bin
-duplicate.  A new entry uses `keepassxc-cli add'."
+A new entry (or a clone) uses `keepassxc-cli add'.  An edit edits the
+entry in place with `keepassxc-cli edit' (passing `-t' when the title
+changed, which renames within the current group); if the `Group' field
+was changed to a different group, the entry is first moved there with
+`keepassxc-cli mv'.  Either way a rename or move never becomes a
+delete+add and never creates a Recycle-Bin duplicate."
   (interactive)
   (let* ((entry (keepass-browse--parse-entry))
          (action (buffer-local-value 'keepass-browse--entry-action (current-buffer)))
          (original (buffer-local-value 'keepass-browse--entry-original (current-buffer)))
          (title (string-trim (keepass-browse--field entry "Title")))
          (password (keepass-browse--field entry "Password"))
-         (path (cond ((string= action "edit")
-                      ;; keepassxc-cli `edit' renames within the current group
-                      ;; via -t; the entry is at ORIGINAL.
-                      original)
-                     ;; add/clone: create under the original entry's group.
-                     (t (concat (if original
-                                     (keepass-browse--entry-directory original)
-                                   "")
-                                (if (string-prefix-p "/" title) title title))))))
+         (group (string-trim (keepass-browse--field entry "Group")))
+         (group (if (string-empty-p group)
+                    ;; No Group given: keep the entry where it already is
+                    ;; (edit), or root for a new entry.
+                    (if original (keepass-browse--entry-directory original) "")
+                  (if (string-suffix-p "/" group) group (concat group "/"))))
+         ;; Where the entry ends up after this commit.
+         (new-path (if (string-prefix-p "/" title) title (concat group title))))
     (when (string-empty-p title)
       (user-error "Title may not be empty"))
     (let* ((dbpw (keepass-browse--db-password))
@@ -885,34 +1020,45 @@ duplicate.  A new entry uses `keepassxc-cli add'."
            (stdin (if (eq dbpw :no-password)
                       (concat password "\n")
                     (concat dbpw "\n" password "\n")))
-           (cli (if (string= action "edit") "edit" "add"))
-           ;; `-t' (title) exists only on `edit'; for `add' the title is part
-           ;; of the entry path and is not passed separately.  Global options
-           ;; (`--no-password', `--key-file') come after the subcommand and
-           ;; before the positional database argument.
+           ;; Global options come before the positional database argument.
            (db (keepass-browse--database-path))
+           (global (append (keepass-auth-source--no-password-flag dbpw)
+                           (keepass-browse--db-keyfile)))
            (common (append (list "-u" (keepass-browse--field entry "UserName")
                                  "--url" (keepass-browse--field entry "URL")
                                  "--notes" (keepass-browse--field entry "Notes")
                                  "-p")))
-           (global (append (keepass-auth-source--no-password-flag dbpw)
-                           (keepass-browse--db-keyfile)))
-           (args (if (string= action "edit")
-                     (append (list cli) global (list db path "-t" title) common)
-                   (append (list cli) global (list db path) common))))
-      (let ((run (apply #'keepass-auth-source--keepassxc-run-stdin stdin args)))
-        (if (eq (cdr run) 0)
-            (progn
-              ;; Re-point and redraw the view buffer at the entry as it now
-              ;; exists: for an edit it may have been renamed via -t; for a
-              ;; clone it is the newly created copy.
-              (keepass-browse-view-refresh
-               (if (string= action "edit")
-                   (concat (keepass-browse--entry-directory (or original "")) title)
-                 path))
-              (kill-buffer (current-buffer))
-              (message "keepassxc-cli %s entry \"%s\"" cli title))
-          (keepass-browse--error (car run)))))))
+           (run
+            (cond
+             ((string= action "edit")
+              (let* ((orig-group (keepass-browse--entry-directory (or original "")))
+                     (moved (not (string-equal orig-group group))))
+                (if (not moved)
+                    ;; Same group: `edit -t' renames in place.
+                    (apply #'keepass-auth-source--keepassxc-run-stdin stdin
+                           (append (list "edit") global (list db original "-t" title) common))
+                  ;; Different group: move first, then edit fields/title at the
+                  ;; new site, so the entry is never deleted and re-added.
+                  (let* ((orig-title (keepass-browse--entry-basename original))
+                         (tmp (concat group orig-title))
+                         (mv (apply #'keepass-auth-source--keepassxc-run-stdin stdin
+                                    (append (list "mv") global (list db original group)))))
+                    (unless (eq (cdr mv) 0)
+                      (keepass-browse--error (car mv)))
+                    (apply #'keepass-auth-source--keepassxc-run-stdin stdin
+                           (append (list "edit") global (list db tmp "-t" title) common))))))
+             (t ; add/clone: create under the chosen group.
+              (apply #'keepass-auth-source--keepassxc-run-stdin stdin
+                     (append (list "add") global (list db new-path) common))))))
+      (if (eq (cdr run) 0)
+          (progn
+            ;; Re-point and redraw the view buffer at the entry as it now
+            ;; exists (a rename, a move, or a fresh clone).
+            (keepass-browse-view-refresh new-path)
+            (kill-buffer (current-buffer))
+            (message "keepassxc-cli %s entry \"%s\""
+                     (if (string= action "edit") "edit" "add") title))
+        (keepass-browse--error (car run))))))
 
 ;;; Embark integration
 

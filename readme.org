@@ -416,6 +416,7 @@ you want to insert a password into your current buffer.
 =keepass-browse-view= shows an entry with its password hidden:
 
 #+BEGIN_SRC text
+  Group      /Internet/Google/
   Title      My server
   UserName   alice
   Password   [hidden - press r]
@@ -439,7 +440,40 @@ commands and take effect directly in the database:
 - *edit* is performed in place (the title may be changed without turning
   the entry into a delete+add), so you never end up with Recycle-Bin
   duplicates;
-- *add* and *clone* create a new entry in the selected entry's group;
+- *move* is part of editing: the edit buffer opens with a =Group: =
+  line above the =Title =.  Editing =Group= to a different group moves
+  the entry there (and keeps any Title change at the same time) via
+  =keepassxc-cli mv=, so it still is never a delete+add;
+- *choosing a group* -- typing a group path by hand is error-prone, so
+  =C-c C-p= in the entry buffer completes over the groups that already
+  exist and fills in the =Group: = line for you.  Every entry buffer opens
+  with a =;; Keys:= hint line showing the keybindings (=C-c C-c= commit,
+  =C-c C-p= select group, =C-c C-r= regenerate, =C-c C-k= cancel), and
+  <kbd>C-h m</kbd> lists them too;
+- *regenerate a password* -- =C-c C-r= asks which generation option to
+  use (completing over the labels of `keepass-browse-generate-options`,
+  e.g. ="upper case"=, ="with numeric"=, ="all printable (!-~)"=,
+  ="passphrase"=) and a length, then runs keepassxc-cli and fills the
+  =Password = line.  The last choices are remembered as defaults.  The
+  options are fully customizable -- each is (LABEL ARGS), where ARGS is
+  the *whole* keepassxc-cli command (subcommand plus flags) with the
+  symbol =:length= standing in for the requested length:
+  #+BEGIN_SRC elisp
+    (setq keepass-browse-generate-options
+          '(("upper case"     ("generate" "--upper" "--length" :length))
+            ("lower case"     ("generate" "--lower" "--length" :length))
+            ("mixed case"     ("generate" "--lower" "--upper" "--length" :length))
+            ("with numeric"   ("generate" "--lower" "--upper" "--numeric" "--length" :length))
+            ("all printable (!-~)"
+             ("generate" "--custom"
+              "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+              "--length" :length))
+            ("passphrase"     ("diceware" "--words" :length))))
+  #+END_SRC
+  =generate= takes =--length=; the diceware =passphrase= takes
+  =--words=.  Add, remove or reorder entries to taste.
+- *add* and *clone* create a new entry under the Group shown at the top of
+  the buffer;
 - *delete* asks for confirmation and moves the entry to the Recycle Bin
   (the browse buffer excludes the Recycle Bin, so the entry disappears
   from the listing).
