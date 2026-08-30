@@ -135,17 +135,6 @@
       (should (equal '(:name "work" :file "/a/work.kdbx") result))
       (should (equal result keepass-browse-database)))))
 
-(ert-deftest keepass-browse-add-databases-to-auth-sources-strips-name ()
-  "Adding the databases to auth-sources drops the browse-only :name."
-  (let* ((keepass-browse-databases
-          '((:name "work" :file "/a/work.kdbx" :keyfile "/a/k")))
-         (auth-sources nil))
-    (keepass-browse-add-databases-to-auth-sources)
-    (should (equal 1 (length auth-sources)))
-    (should (equal "/a/work.kdbx" (keepass-db-spec-file (car auth-sources))))
-    (should-not (keepass-db-spec-name (car auth-sources)))
-    (should (equal "/a/k" (keepass-db-spec-keyfile (car auth-sources))))))
-
 (ert-deftest keepass-browse-entry-mode-map-bindings ()
   "The entry-mode keymap binds group-choosing to `C-c C-p'.
 Not `C-c C-g': a C-g after a prefix key is treated by Emacs as \"cancel

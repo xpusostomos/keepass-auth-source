@@ -1324,22 +1324,5 @@ Completes over each entry's label (its `:name', or the file name)."
     (message "Using KeePass database %s" chosen)
     keepass-browse-database))
 
-;;;###autoload
-(defun keepass-browse-add-databases-to-auth-sources ()
-  "Add every database spec in `keepass-browse-databases' to `auth-sources'.
-Each entry is appended to `auth-sources' (without its browse-only `:name')
-so `keepass-auth-source' can search all of them.  Call after setting
-`keepass-browse-databases' and before/after `keepass-auth-source-enable'."
-  (interactive)
-  (dolist (entry keepass-browse-databases)
-    (let* ((spec (keepass-db-spec-normalize entry))
-           (auth-spec (keepass-make-db-spec
-                       :file (keepass-db-spec-file spec)
-                       :keyfile (keepass-db-spec-keyfile spec)
-                       :password (keepass-db-spec-password spec)
-                       :yubi (keepass-db-spec-yubi spec))))
-      (unless (member auth-spec auth-sources)
-        (setq auth-sources (append auth-sources (list auth-spec)))))))
-
 (provide 'keepass-browse)
 ;;; keepass-browse.el ends here

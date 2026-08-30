@@ -503,15 +503,13 @@ All are =defcustom=s, adjustable with <kbd>M-x</kbd>
 
 *** Sharing databases with auth-source
 
-If you use both packages, tell auth-source about the databases you
-configured for browsing so email/ERC/etc. can use them too:
+The browse list is already a list of database spec plists, so telling
+=auth-source= about your browsing databases (so email/ERC/etc. can use
+them too) is just an append:
 
 #+BEGIN_SRC elisp
-  (keepass-browse-add-databases-to-auth-sources)
+  (setq auth-sources (append auth-sources keepass-browse-databases))
 #+END_SRC
-
-This appends each =SPEC= from =keepass-browse-databases= to
-=auth-sources= (skipping duplicates).
 
 ** Tests
 
