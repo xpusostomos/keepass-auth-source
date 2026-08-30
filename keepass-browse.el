@@ -68,36 +68,41 @@
   "List of KeePass databases available for browsing.
 Each element is a cons cell (NAME . SPEC), where NAME is a user-visible
 label shown by `keepass-browse-select-database', and SPEC is a database
-specification for `keepass-auth-source' -- a file name (string) or a list
-\\(PATH [KEYFILE] [PASSWORD]).  See `keepass-auth-source--normalize-db'."
+specification for `keepass-auth-source': a file name (string), a legacy
+positional list (PATH [KEYFILE] [PASSWORD]), or a keyword plist from
+`keepass-make-db-spec'.  See `keepass-db-spec-normalize'."
   :type '(repeat (cons (string :tag "Name")
                        (choice (file :tag "Database file")
-                               (list :tag "Database spec"
+                               (list :tag "Database spec (path [keyfile] [password])"
                                      (file :tag "Path")
                                      (choice (const :tag "No key file" nil)
                                              (file :tag "Key file")
                                              function)
-                                     (choice (const :tag "Prompt" nil)
+                                     (choice (const :tag "Prompt (ask user)" :prompt)
+                                             (const :tag "No password" nil)
                                              (string :tag "Password")
-                                             function)))))
+                                             function))
+                               keepass-db-spec)))
   :group 'keepass-browse)
 
 (defcustom keepass-browse-database nil
   "The currently active KeePass database specification.
-Either a database file name (string), or a list \\(PATH [KEYFILE]
-[PASSWORD]) as understood by `keepass-auth-source'.  Set interactively
-with `keepass-browse-select-database'.  See
-`keepass-auth-source--normalize-db'."
+Either a database file name (string), a legacy positional list (PATH
+[KEYFILE] [PASSWORD]), or a keyword plist from `keepass-make-db-spec',
+as understood by `keepass-auth-source'.  Set interactively with
+`keepass-browse-select-database'.  See `keepass-db-spec-normalize'."
   :type '(choice (const :tag "None" nil)
                  (file :tag "Database file")
-                 (list :tag "Database spec"
+                 (list :tag "Database spec (path [keyfile] [password])"
                        (file :tag "Path")
                        (choice (const :tag "No key file" nil)
                                (file :tag "Key file")
                                function)
-                       (choice (const :tag "Prompt" nil)
+                       (choice (const :tag "Prompt (ask user)" :prompt)
+                               (const :tag "No password" nil)
                                (string :tag "Password")
-                               function)))
+                               function))
+                 keepass-db-spec)
   :group 'keepass-browse)
 
 ;; If the database *list* is re-set, any previously selected database may
@@ -172,6 +177,13 @@ password, i.e. a stored two-factor code; see `keepass-browse-copy-totp'.)")
 (defvar keepass-browse-history nil
   "History for `keepass-browse-select'.")
 
+;; vertico is an optional completion framework (consult works without it);
+;; these variables only exist once vertico is loaded, hence the `defvar'
+;; declarations so the byte-compiler does not warn about them, and the
+;; `bound-and-true-p' guards at the call sites.
+(defvar vertico--index)
+(defvar vertico--candidates)
+
 ;;; Subprocess plumbing
 ;;
 ;; All keepassxc-cli execution and master-password prompting is shared with
@@ -187,10 +199,11 @@ password, i.e. a stored two-factor code; see `keepass-browse-copy-totp'.)")
 
 (defun keepass-browse--database-path ()
   "Return the active database's expanded file path.
-The first element of the active database's spec, expanded so a leading
-\"~\" works; `file-exists-p' accepts \"~\" but keepassxc-cli does not."
+The `:file' of the active database's spec, expanded so a leading \"~\"
+works; `file-exists-p' accepts \"~\" but keepassxc-cli does not."
   (let ((spec (keepass-browse--db-spec)))
-    (expand-file-name (car (keepass-auth-source--normalize-db spec)))))
+    (expand-file-name
+     (keepass-db-spec-file (keepass-db-spec-normalize spec)))))
 
 (defun keepass-browse--db-keyfile ()
   "Return the active database's key file argument list, or nil.
@@ -198,16 +211,25 @@ A list (\"--key-file\" FILE), ready to splice into a keepassxc-cli
 invocation."
   (let ((spec (keepass-browse--db-spec)))
     (keepass-auth-source--keyfile-args
-     (nth 1 (keepass-auth-source--normalize-db spec)))))
+     (keepass-db-spec-keyfile (keepass-db-spec-normalize spec)))))
+
+(defun keepass-browse--db-yubi ()
+  "Return the active database's YubiKey argument list, or nil.
+A list (\"--yubikey\" VALUE), ready to splice into a keepassxc-cli
+invocation."
+  (let ((spec (keepass-browse--db-spec)))
+    (keepass-auth-source--yubi-args
+     (keepass-db-spec-yubi (keepass-db-spec-normalize spec)))))
 
 (defun keepass-browse--db-password ()
   "Return the active database's master password, per its spec.
-A string or function in the spec is used as-is; nil prompts the user via
-`password-cache' (keyed by the database path), honoring
-`keepass-browse-cache-expiry'."
+A string or function in the spec is used as-is; `:prompt' (or an
+unspecified password) asks the user via `password-cache' (keyed by the
+database path), honoring `keepass-browse-cache-expiry'; nil means no
+password and resolves to `:no-password'."
   (let ((db (keepass-browse--database-path))
-        (password-spec (nth 2 (keepass-auth-source--normalize-db
-                               keepass-browse-database))))
+        (password-spec (keepass-db-spec-password
+                        (keepass-db-spec-normalize keepass-browse-database))))
     (keepass-auth-source--resolve-password
      password-spec db keepass-browse-cache-expiry)))
 
@@ -220,11 +242,13 @@ Deprecated alias kept for call-site clarity; use `keepass-browse--db-password'."
   "Run keepassxc-cli with ARGS on the active database.
 PASSWORD is the resolved master password, or `:no-password' for a
 passwordless database (which gets keepassxc-cli's --no-password global
-option and no stdin).  Looks up the key file from the active spec."
+option and no stdin).  Looks up the key file and YubiKey from the active
+spec."
   (apply #'keepass-auth-source--keepassxc-run
          password
          (append (keepass-auth-source--no-password-flag password)
                  (keepass-browse--db-keyfile)
+                 (keepass-browse--db-yubi)
                  args)))
 
 (defun keepass-browse--run-stdin (password stdin &rest args)
@@ -238,6 +262,7 @@ resolved master password (possibly `:no-password')."
          password
          (keepass-auth-source--no-password-flag password)
          (keepass-browse--db-keyfile)
+         (keepass-browse--db-yubi)
          args))
 
 (defun keepass-browse--error (output)
@@ -503,6 +528,12 @@ that merely looks similar cannot resolve to the wrong entry."
     (keepass-browse--kill (keepass-browse--field entry "Password")
                           "Password copied to clipboard")))
 
+(defvar-local keepass-browse-view--revealed nil
+  "Non-nil while the password is shown in the current view buffer.")
+
+(defvar-local keepass-browse-view-path nil
+  "The entry path shown in `keepass-browse-view-mode'.")
+
 (defconst keepass-browse-view-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -523,12 +554,6 @@ password reveal (r) and quit (q) are view-only.")
 (define-derived-mode keepass-browse-view-mode special-mode "kb-view"
   "Major mode for viewing a KeePass entry.  Password is hidden until
 \\[keepass-browse-view-reveal].")
-
-(defvar-local keepass-browse-view--revealed nil
-  "Non-nil while the password is shown in the current view buffer.")
-
-(defvar-local keepass-browse-view-path nil
-  "The entry path shown in `keepass-browse-view-mode'.")
 
 (defun keepass-browse--view-menu ()
   "Return the key menu shown at the bottom of the view buffer.

@@ -393,26 +393,78 @@ A search must return all entries that match *every* key given, and only them."
     (should (funcall m '(:host "https://smtp.gmail.com/some/path" :user "x")))
     (should-not (funcall m '(:host "other.example" :user "x")))))
 
-;;;; DB spec normalization
+;;;; DB spec: constructor, accessors, predicate, normalization
 
-(ert-deftest keepass-auth-source-normalize-db ()
-  "A string or list DB spec normalizes to (PATH KEYFILE PASSWORD)."
-  ;; Plain string: no keyfile, password = prompt (:prompt).
-  (should (equal '("db.kdbx" nil :prompt)
-                 (keepass-auth-source--normalize-db "db.kdbx")))
+(ert-deftest keepass-make-db-spec-constructor ()
+  "`keepass-make-db-spec' builds a canonical keyword plist.
+An omitted `:password' is NOT an explicit nil: the latter means a
+database with no master password, while omission means `:prompt'."
+  ;; All fields given; canonical key order is :file :keyfile :password :yubi.
+  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password "pw" :yubi "1:7370001")
+                 (keepass-make-db-spec :password "pw" :yubi "1:7370001"
+                                       :file "db.kdbx" :keyfile "k.txt")))
+  ;; Password omitted -> :prompt.
+  (should (equal :prompt
+                 (plist-get (keepass-make-db-spec :file "db.kdbx") :password)))
+  ;; Password explicitly nil -> nil (genuinely no master password).
+  (should (eq nil (plist-get (keepass-make-db-spec :file "db.kdbx" :password nil)
+                             :password)))
+  ;; Keyfile and yubi default to nil.
+  (should-not (plist-get (keepass-make-db-spec :file "db.kdbx") :keyfile))
+  (should-not (plist-get (keepass-make-db-spec :file "db.kdbx") :yubi))
+  ;; Unknown keywords are rejected up front.
+  (should-error (keepass-make-db-spec :file "db" :bogus 1))
+  ;; A spec must spell out a :file.
+  (should-error (keepass-make-db-spec :password "pw")))
+
+(ert-deftest keepass-db-spec-predicate ()
+  "`keepass-db-spec-p' recognizes spec plists, not strings/lists/garbage."
+  (should (keepass-db-spec-p
+           (keepass-make-db-spec :file "db.kdbx" :password nil)))
+  (should (keepass-db-spec-p '(:file "db.kdbx")))
+  ;; A positional list, a string, and a plist with an unknown keyword aren't.
+  (should-not (keepass-db-spec-p "db.kdbx"))
+  (should-not (keepass-db-spec-p '("db.kdbx" "k.txt")))
+  (should-not (keepass-db-spec-p '(:file "db.kdbx" :bogus 1)))
+  ;; A spec without :file is incomplete.
+  (should-not (keepass-db-spec-p '(:keyfile "k.txt"))))
+
+(ert-deftest keepass-db-spec-accessors ()
+  "The `keepass-db-spec-*' accessors read the canonical fields."
+  (let* ((kf (lambda () "k.txt"))
+         (ps (lambda () "pw"))
+         (spec (keepass-make-db-spec :file "db.kdbx" :keyfile kf
+                                     :password ps :yubi "1:7")))
+    (should (equal "db.kdbx" (keepass-db-spec-file spec)))
+    (should (eq kf (keepass-db-spec-keyfile spec)))
+    (should (eq ps (keepass-db-spec-password spec)))
+    (should (equal "1:7" (keepass-db-spec-yubi spec)))))
+
+(ert-deftest keepass-db-spec-normalize ()
+  "A string, positional list or spec plist normalizes to the canonical plist."
+  ;; Plain string: canonical plist, password = :prompt.
+  (should (equal '(:file "db.kdbx" :keyfile nil :password :prompt :yubi nil)
+                 (keepass-db-spec-normalize "db.kdbx")))
   ;; (PATH KEYFILE PASSWORD): all present.
-  (should (equal '("db.kdbx" "k.txt" "pw")
-                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt" "pw"))))
-  ;; (PATH KEYFILE): password absent = prompt (:prompt).
-  (should (equal '("db.kdbx" "k.txt" :prompt)
-                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt"))))
-  ;; (PATH KEYFILE nil): password present-but-nil = no password (nil).
-  (should (equal '("db.kdbx" "k.txt" nil)
-                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt" nil))))
+  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password "pw" :yubi nil)
+                 (keepass-db-spec-normalize '("db.kdbx" "k.txt" "pw"))))
+  ;; (PATH KEYFILE): password absent = :prompt.
+  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password :prompt :yubi nil)
+                 (keepass-db-spec-normalize '("db.kdbx" "k.txt"))))
+  ;; (PATH KEYFILE nil): password present-but-nil = no password.
+  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password nil :yubi nil)
+                 (keepass-db-spec-normalize '("db.kdbx" "k.txt" nil))))
   ;; Key file and password may be functions, retained as-is.
   (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")))
-    (should (equal (list "db.kdbx" kf ps)
-                   (keepass-auth-source--normalize-db (list "db.kdbx" kf ps))))))
+    (should (equal (list :file "db.kdbx" :keyfile kf :password ps :yubi nil)
+                   (keepass-db-spec-normalize (list "db.kdbx" kf ps)))))
+  ;; A spec plist carries its fields through, re-canonicalized.
+  (should (equal '(:file "d.kdbx" :keyfile nil :password nil :yubi "1:7")
+                 (keepass-db-spec-normalize (keepass-make-db-spec
+                                             :file "d.kdbx" :password nil
+                                             :yubi "1:7"))))
+  ;; Garbage is rejected.
+  (should-error (keepass-db-spec-normalize 42)))
 
 (ert-deftest keepass-auth-source-resolve-keyfile-password ()
   "Key file and password specs accept strings, functions, :prompt and nil."
@@ -426,6 +478,22 @@ A search must return all entries that match *every* key given, and only them."
   ;; nil means NO password, reported as the `:no-password' sentinel.
   (should (eq :no-password
               (keepass-auth-source--resolve-password nil "nopwdb"))))
+
+;;;; YubiKey argument generation
+
+(ert-deftest keepass-auth-source-yubi-args ()
+  "`--yubikey' arguments are built from a string, a function, or nil."
+  (should (equal '("--yubikey" "1:7370001")
+                 (keepass-auth-source--yubi-args "1:7370001")))
+  (should (equal '("--yubikey" "2")
+                 (keepass-auth-source--yubi-args (lambda () "2"))))
+  (should-not (keepass-auth-source--yubi-args nil))
+  (should-not (keepass-auth-source--yubi-args 42))
+  ;; The shared string-or-function resolver backs keyfile and yubi on the same
+  ;; rules.
+  (should (equal "s" (keepass-auth-source--resolve-string "s")))
+  (should (equal "s" (keepass-auth-source--resolve-string (lambda () "s"))))
+  (should-not (keepass-auth-source--resolve-string nil)))
 
 ;;;; Negative-cache suppression
 
@@ -557,6 +625,36 @@ from a string or from a function in the spec."
       (ignore-errors (delete-file db))
       (ignore-errors (delete-file keyfile))
       (ignore-errors (delete-directory dir)))))
+
+(ert-deftest keepass-auth-source-plist-spec-integration ()
+  "A keyword spec plist in `auth-sources' drives a working search.
+Exercises `keepass-make-db-spec' through the backend parser and the full
+search path (password supplied as a string in the spec)."
+  (let* ((keepass-auth-source-cache-expiry nil)
+         (keepass-auth-source--active-cli 'keepassxc)
+         (dir (make-temp-file "kpa-spec-" t))
+         (db (concat (file-name-as-directory (make-temp-file "spec-db-" t)) "db.kdbx")))
+    (unless (executable-find "keepassxc-cli")
+      (ert-skip "keepassxc-cli not available"))
+    (with-temp-buffer
+      (call-process "sh" nil t nil "-c"
+                    (concat "printf 'SPECPW\\nSPECPW\\n' | keepassxc-cli db-create -q "
+                            (shell-quote-argument db) " --set-password"))
+      (call-process "sh" nil t nil "-c"
+                    (concat "printf 'SPECPW\\n' | keepassxc-cli add -q "
+                            (shell-quote-argument db)
+                            " spec -u me@spec --url spec.example")))
+    (add-hook 'auth-source-backend-parser-functions
+              #'keepass-auth-source-backend-parser)
+    (unwind-protect
+        (let ((password-cache-expiry nil)
+              (auth-sources (list (keepass-make-db-spec :file db :password "SPECPW"))))
+          (let ((res (auth-source-search :host "spec.example" :user "me@spec"
+                                         :port "465" :require '(:secret))))
+            (should (= 1 (length res)))
+            (should (equal "me@spec" (plist-get (car res) :user)))
+            (should (stringp (funcall (plist-get (car res) :secret))))))
+      (ignore-errors (delete-file db)))))
 
 (provide 'keepass-auth-source-test)
 ;;; keepass-auth-source-test.el ends here

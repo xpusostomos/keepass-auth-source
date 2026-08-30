@@ -47,6 +47,7 @@
 (require 'password-cache)
 (require 'seq)
 (require 'simple)
+(require 'url-parse)
 
 ;;; Portability helpers (previously provided by dash.el / s.el, kept local
 ;;; so this package can run with zero external dependencies).
@@ -208,37 +209,130 @@ password."
               "\n")
    port))
 
-(defun keepass-auth-source--normalize-db (spec)
-  "Normalize a database SPEC to (PATH KEYFILE PASSWORD).
+;;;; Database specification
+;;
+;; Databases are described by a keyword *spec* plist built with
+;; `keepass-make-db-spec', read with the `keepass-db-spec-*' accessors, and
+;; stored in canonical key order.  Because the spec is a plain plist (not a
+;; `cl-defstruct'), `equal' comparisons, printing and Customize's `plist'
+;; widget all work on it directly; the accessors hide the key order, so the
+;; representation could be swapped for a struct later without changing any
+;; caller.
 
-SPEC is one `auth-sources' entry (or `keepass-browse-database').  It is
-either a string -- the database path, with no key file and an
-interactively-requested password -- or a list:
+(defconst keepass-db-spec-keys '(:file :keyfile :password :yubi)
+  "The keywords of a keepass database spec, in canonical order.")
 
-  (PATH [KEYFILE] [PASSWORD])
+(define-widget 'keepass-db-spec 'plist
+  "Customize widget for a keepass database specification keyword plist.
+See `keepass-make-db-spec' for the meaning of each keyword.  The value
+type is a lenient catch-all (a value may be a string, a function, the
+symbol `:prompt', or nil) because which shape is valid depends on the
+keyword."
+  :key-type '(choice (const :file)
+                     (const :keyfile)
+                     (const :password)
+                     (const :yubi))
+  :value-type '(choice (const :prompt)
+                       (const :tag "none" nil)
+                       (string :tag "text")
+                       function))
 
-PATH is the database file name.  KEYFILE, if present and non-nil, is
-either a string (the key file's name) or a function of no arguments
-returning the file name; nil means no key file.
+(defun keepass-make-db-spec (&rest spec-plist)
+  "Build a keepass database spec keyword plist from SPEC-PLIST.
 
-PASSWORD distinguishes three cases:
-  absent (list has no third element)   -> prompt the user (the default)
-  nil (the third element is literally nil) -> the database has NO password
-  a string or no-argument function     -> that password
+Accepted keywords (see `keepass-db-spec-keys'):
+  :file      the kdbx file path (string).  The only required keyword.
+  :keyfile   the key file: a file name, a no-argument function returning
+             one, or nil for none.
+  :password  the master password: a string, a no-argument function
+             returning one, `:prompt' to ask the user, or nil for a
+             database with no master password.
+             Omitted means `:prompt'.
+  :yubi      a YubiKey: a keepassxc-cli \"slot[:serial]\" string (e.g.
+             \"1:7370001\"), a no-argument function returning one, or nil
+             for none.
 
-Returns (PATH KEYFILE PASSWORD) where KEYFILE is a file-name string or
-nil, and PASSWORD is a string, a function, the symbol `:prompt' (meaning
-ask the user), or nil (meaning no password)."
-  (let ((path spec) keyfile password has-password)
-    (when (consp spec)
-      (setq path (nth 0 spec)
-            keyfile (nth 1 spec)
-            has-password (> (length spec) 2)
-            password (nth 2 spec)))
-    (list path keyfile
-          (cond ((not (consp spec)) :prompt)      ; plain string -> prompt
-                ((not has-password) :prompt)
-                (t password)))))
+An absent `:password' is NOT the same as an explicit nil -- nil means the
+database genuinely has no master password.  The result is returned in
+canonical key order so `equal' comparisons are order-independent."
+  (let* ((file (plist-get spec-plist :file))
+         (keyfile (plist-get spec-plist :keyfile))
+         (password (if (plist-member spec-plist :password)
+                       (plist-get spec-plist :password)
+                     :prompt))
+         (yubi (plist-get spec-plist :yubi)))
+    ;; Reject unknown keywords, walking only the key positions: values may
+    ;; themselves be keywords (e.g. `:password :prompt') and must not be
+    ;; mistaken for keys.
+    (let ((tail spec-plist))
+      (while tail
+        (let ((key (car tail)))
+          (when (and (keywordp key)
+                     (not (memq key keepass-db-spec-keys)))
+            (user-error "Unknown keepass database spec keyword: %S" key)))
+        (setq tail (cdr tail))
+        (when tail (setq tail (cdr tail)))))
+    (unless (stringp file)
+      (user-error "keepass database spec requires a `:file' keyword"))
+    (list :file file :keyfile keyfile :password password :yubi yubi)))
+
+(defun keepass-db-spec-p (spec)
+  "Return non-nil if SPEC is a keepass database spec keyword plist.
+A spec is a plist whose own keywords all belong to
+`keepass-db-spec-keys' and which spells out a `:file'.  Values may be any
+Lisp object."
+  (and (consp spec)
+       (plist-member spec :file)
+       (let ((tail spec) (ok t))
+         ;; Walk only the key (odd) positions.
+         (while (and ok tail)
+           (unless (memq (car tail) keepass-db-spec-keys)
+             (setq ok nil))
+           (setq tail (cdr tail))
+           (when tail (setq tail (cdr tail))))
+         ok)))
+
+(defun keepass-db-spec-file (spec)
+  "Return the kdbx file path of database spec SPEC."
+  (plist-get spec :file))
+
+(defun keepass-db-spec-keyfile (spec)
+  "Return the key file spec of database SPEC, or nil.
+A file-name string, a no-argument function, or nil."
+  (plist-get spec :keyfile))
+
+(defun keepass-db-spec-password (spec)
+  "Return the password spec of database SPEC.
+A string, a no-argument function, `:prompt' (ask the user), or nil (no
+master password)."
+  (plist-get spec :password))
+
+(defun keepass-db-spec-yubi (spec)
+  "Return the YubiKey spec of database SPEC, or nil.
+A keepassxc-cli \"slot[:serial]\" string, a no-argument function, or nil."
+  (plist-get spec :yubi))
+
+(defun keepass-db-spec-normalize (spec)
+  "Coerce SPEC into a canonical keepass database spec plist.
+
+SPEC is one database entry as it may appear in `auth-sources' or
+`keepass-browse-databases':
+  - a file name (string), meaning no key file/YubiKey and a master
+    password that prompts the user;
+  - a positional list (PATH [KEYFILE] [PASSWORD]) -- the legacy form;
+    an absent PASSWORD prompts, an explicit nil means no password;
+  - a keyword plist built with `keepass-make-db-spec', re-canonicalized.
+
+Returns a plist with the keys of `keepass-db-spec-keys'.  Read it with
+the `keepass-db-spec-*' accessors."
+  (cond
+   ((keepass-db-spec-p spec) (apply #'keepass-make-db-spec spec))
+   ((stringp spec) (keepass-make-db-spec :file spec))
+   ((consp spec)
+    (keepass-make-db-spec :file (nth 0 spec)
+                          :keyfile (nth 1 spec)
+                          :password (if (> (length spec) 2) (nth 2 spec) :prompt)))
+   (t (user-error "Invalid keepass database spec: %S" spec))))
 
 (defun keepass-auth-source--no-password (db)
   "Return whether DB has no master password, honouring a cached answer.
@@ -253,8 +347,8 @@ password cache keyed by DB records a yes-or-no answer."
 Returns a string (the password), or the symbol `:no-password' meaning the
 database has no master password and `--no-password' must be passed to
 keepassxc-cli.  The cases:
-  `keepass-auth-source--normalize-db''s `:prompt'  -> ask the user (and
-      cache) as usual, returning the typed string;
+  `:prompt'  -> ask the user (and cache) as usual, returning the typed
+      string;
   a string     -> used as-is;
   a function   -> called to obtain its result;
   nil          -> the database has no master password; return `:no-password'."
@@ -265,14 +359,20 @@ keepassxc-cli.  The cases:
     (:prompt (keepass-auth-source--read-password db expiry))
     (_ :no-password)))
 
+(defun keepass-auth-source--resolve-string (value)
+  "Resolve VALUE to a string, or nil.
+A string is returned as-is, a no-argument function is called for its
+result, and anything else (including nil) means nil."
+  (pcase value
+    ((pred stringp) value)
+    ((pred functionp) (funcall value))
+    (_ nil)))
+
 (defun keepass-auth-source--resolve-keyfile (keyfile)
   "Resolve a key file specification KEYFILE to a file name, or nil.
 A string is the file name; a function is called to obtain it; anything
 else (including nil) means no key file."
-  (pcase keyfile
-    ((pred stringp) keyfile)
-    ((pred functionp) (funcall keyfile))
-    (_ nil)))
+  (keepass-auth-source--resolve-string keyfile))
 
 (defun keepass-auth-source--read-password (db &optional expiry)
   "Read the master password for database DB, caching it for reuse.
@@ -294,6 +394,14 @@ nil for no key file.  Returns (\"--key-file\" FILE) or nil, with FILE
 expanded so a leading \"~\" works."
   (when-let* ((file (keepass-auth-source--resolve-keyfile keyfile)))
     (list "--key-file" (expand-file-name file))))
+
+(defun keepass-auth-source--yubi-args (yubi)
+  "Return the keepassxc-cli arguments for YubiKey YUBI, or nil.
+YUBI is a keepassxc-cli \"slot[:serial]\" string (e.g. \"1:7370001\"), a
+no-argument function returning one, or nil for no YubiKey.  Returns
+\(\"--yubikey\" VALUE), ready to splice into a keepassxc-cli invocation."
+  (when-let* ((y (keepass-auth-source--resolve-string yubi)))
+    (list "--yubikey" y)))
 
 (defun keepass-auth-source--log (format-string &rest args)
   "Append a line to the *keepass-auth-source-log* buffer (read-only).
@@ -467,17 +575,19 @@ Applies host/user/port to the canonical KeePass fields:
          (or (string-blank-p (or notes ""))    ; notes matches
              (keepass-auth-source-s-contains-p notes e-notes t)))))))
 
-(defun keepass-auth-source--keepassxc-narrow (entity password term &optional keyfile)
+(defun keepass-auth-source--keepassxc-narrow (entity password term &optional keyfile yubi)
   "Return the entry paths in ENTITY whose any field contains TERM.
 Uses the server-side `search' command so only a handful of candidates
 are returned, instead of every entry in the database.  KEYFILE, when
 non-nil, is the database's key file (see
-`keepass-auth-source--keyfile-args')."
+`keepass-auth-source--keyfile-args'); YUBI, likewise, is its YubiKey spec
+\(see `keepass-auth-source--yubi-args')."
   (let* ((run (apply #'keepass-auth-source--keepassxc-run
                      password
                      (append (list "search" "--quiet")
                              (keepass-auth-source--no-password-flag password)
                              (keepass-auth-source--keyfile-args keyfile)
+                             (keepass-auth-source--yubi-args yubi)
                              (list entity term))))
          (output (car run))
          (exit (cdr run)))
@@ -504,17 +614,19 @@ the full SPEC.  Returns (ENTRIES . STATUS)."
   (let* ((status nil)
          (db (plist-get spec :db))
          (keyfile (plist-get spec :keyfile))
+         (yubi (plist-get spec :yubi))
          (term (keepass-auth-source-keepassxc-term spec))
          (open (apply #'keepass-auth-source--keepassxc-run
                       password
                       (append (list "ls" "--quiet")
                               (keepass-auth-source--no-password-flag password)
                               (keepass-auth-source--keyfile-args keyfile)
+                              (keepass-auth-source--yubi-args yubi)
                               (list db))))
          (locked-p (not (eq (cdr open) 0)))
          (paths (and (not locked-p) term
                      (keepass-auth-source--keepassxc-narrow
-                      db password term keyfile)))
+                      db password term keyfile yubi)))
          (matcher (keepass-auth-source-keepassxc-spec-matcher spec))
          (entries
          (and paths
@@ -526,6 +638,7 @@ the full SPEC.  Returns (ENTRIES . STATUS)."
                                              (list "show" "--quiet" "--show-protected")
                                              (keepass-auth-source--no-password-flag password)
                                              (keepass-auth-source--keyfile-args keyfile)
+                                             (keepass-auth-source--yubi-args yubi)
                                              (list db path)))))
                               paths))
                       (entries (mapcar (lambda (show) (keepass-auth-source--keepassxc-parse
@@ -558,19 +671,21 @@ nil for backends that do not emit one."
                    keepass-auth-source-cli))))
 
 (cl-defun keepass-auth-source-search (&rest spec
-                                      &key backend type host user port max title
+                                      &key backend host user port max title
                                         &allow-other-keys)
-  "Find password for a request, if several passwords are available prompt user to select an entry."
-  (let* ((db-info (keepass-auth-source--normalize-db
-                   (slot-value backend 'source)))
-         (entity (nth 0 db-info))
+  "Find the password for a request.
+If several passwords are available, prompt the user to select an entry."
+  (let* ((db-info (keepass-db-spec-normalize (slot-value backend 'source)))
+         (entity (keepass-db-spec-file db-info))
          (keyfile (or (plist-get (slot-value backend 'data) :keyfile)
-                      (nth 1 db-info)))
+                      (keepass-db-spec-keyfile db-info)))
          (password-spec (or (plist-get (slot-value backend 'data) :password-spec)
                             ;; backend built with a plain string :source has
                             ;; no :data; default to :prompt (ask user), never
                             ;; to nil (which would mean "no password").
-                            (nth 2 db-info))))
+                            (keepass-db-spec-password db-info)))
+         (yubi (or (plist-get (slot-value backend 'data) :yubi)
+                   (keepass-db-spec-yubi db-info))))
     (when (file-exists-p entity)
       (when keepass-auth-source-verbose
         (message "keepass-auth-source-search spec: host=%S user=%S port=%S title=%S"
@@ -586,7 +701,7 @@ nil for backends that do not emit one."
                         password-spec entity keepass-auth-source-cache-expiry))
              (spec `(:host ,host :user ,user :port ,port :title ,title
                         :path ,path :db ,entity
-                        :keyfile ,keyfile))
+                        :keyfile ,keyfile :yubi ,yubi))
              (parsed (keepass-auth-source--list-entries entity spec password))
              (result (nth 0 parsed))
              (status (nth 1 parsed)))
@@ -636,22 +751,24 @@ nil for backends that do not emit one."
 
 (defun keepass-auth-source-backend-parser (entry)
   "Provides keepass backend for files with the .kdbx extension.
-ENTRY may be a plain database file name, or a list
-\(PATH [KEYFILE] [PASSWORD]) -- see `keepass-auth-source--normalize-db'.
-For the list form the key file and password specifications are carried on
-the backend's `data' slot so the search can honour them."
-  (let* ((db (keepass-auth-source--normalize-db entry))
-         (path (nth 0 db)))
+ENTRY may be a plain database file name, a positional list
+\(PATH [KEYFILE] [PASSWORD]), or a keyword spec from
+`keepass-make-db-spec' -- see `keepass-db-spec-normalize'.
+The key file, password and YubiKey specifications are carried on the
+backend's `data' slot so the search can honour them."
+  (let* ((db (keepass-db-spec-normalize entry))
+         (path (keepass-db-spec-file db)))
     (when (and (stringp path)
                (string-equal "kdbx" (file-name-extension path)))
       (auth-source-backend :type 'keepass
                            :source path
                            :search-function #'keepass-auth-source-search
-                           ;; Stash the key file and password specs for the
-                           ;; search function; auth-source's own parameter
-                           ;; parsing ignores unknown list entries.
-                           :data (list :keyfile (nth 1 db)
-                                       :password-spec (nth 2 db))))))
+                           ;; Stash the key file, password and YubiKey specs
+                           ;; for the search function; auth-source's own
+                           ;; parameter parsing ignores unknown list entries.
+                           :data (list :keyfile (keepass-db-spec-keyfile db)
+                                       :password-spec (keepass-db-spec-password db)
+                                       :yubi (keepass-db-spec-yubi db))))))
 
 (defun keepass-auth-source--remember-advice (fn spec found)
   "Call auth-source-remember FN unless FOUND is empty.
