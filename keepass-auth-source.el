@@ -318,9 +318,7 @@ A keepassxc-cli \"slot[:serial]\" string, a no-argument function, or nil."
 SPEC is one database entry as it may appear in `auth-sources' or
 `keepass-browse-databases':
   - a file name (string), meaning no key file/YubiKey and a master
-    password that prompts the user;
-  - a positional list (PATH [KEYFILE] [PASSWORD]) -- the legacy form;
-    an absent PASSWORD prompts, an explicit nil means no password;
+    password that prompts the user, or
   - a keyword plist built with `keepass-make-db-spec', re-canonicalized.
 
 Returns a plist with the keys of `keepass-db-spec-keys'.  Read it with
@@ -328,11 +326,7 @@ the `keepass-db-spec-*' accessors."
   (cond
    ((keepass-db-spec-p spec) (apply #'keepass-make-db-spec spec))
    ((stringp spec) (keepass-make-db-spec :file spec))
-   ((consp spec)
-    (keepass-make-db-spec :file (nth 0 spec)
-                          :keyfile (nth 1 spec)
-                          :password (if (> (length spec) 2) (nth 2 spec) :prompt)))
-   (t (user-error "Invalid keepass database spec: %S" spec))))
+   (t (user-error "Invalid keepass database spec: %S (use a file name or `keepass-make-db-spec')" spec))))
 
 (defun keepass-auth-source--no-password (db)
   "Return whether DB has no master password, honouring a cached answer.
@@ -751,8 +745,7 @@ If several passwords are available, prompt the user to select an entry."
 
 (defun keepass-auth-source-backend-parser (entry)
   "Provides keepass backend for files with the .kdbx extension.
-ENTRY may be a plain database file name, a positional list
-\(PATH [KEYFILE] [PASSWORD]), or a keyword spec from
+ENTRY may be a plain database file name or a keyword spec from
 `keepass-make-db-spec' -- see `keepass-db-spec-normalize'.
 The key file, password and YubiKey specifications are carried on the
 backend's `data' slot so the search can honour them."

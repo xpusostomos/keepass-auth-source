@@ -441,28 +441,26 @@ database with no master password, while omission means `:prompt'."
     (should (equal "1:7" (keepass-db-spec-yubi spec)))))
 
 (ert-deftest keepass-db-spec-normalize ()
-  "A string, positional list or spec plist normalizes to the canonical plist."
+  "A string or spec plist normalizes to the canonical plist."
   ;; Plain string: canonical plist, password = :prompt.
   (should (equal '(:file "db.kdbx" :keyfile nil :password :prompt :yubi nil)
                  (keepass-db-spec-normalize "db.kdbx")))
-  ;; (PATH KEYFILE PASSWORD): all present.
-  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password "pw" :yubi nil)
-                 (keepass-db-spec-normalize '("db.kdbx" "k.txt" "pw"))))
-  ;; (PATH KEYFILE): password absent = :prompt.
-  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password :prompt :yubi nil)
-                 (keepass-db-spec-normalize '("db.kdbx" "k.txt"))))
-  ;; (PATH KEYFILE nil): password present-but-nil = no password.
-  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password nil :yubi nil)
-                 (keepass-db-spec-normalize '("db.kdbx" "k.txt" nil))))
-  ;; Key file and password may be functions, retained as-is.
-  (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")))
-    (should (equal (list :file "db.kdbx" :keyfile kf :password ps :yubi nil)
-                   (keepass-db-spec-normalize (list "db.kdbx" kf ps)))))
   ;; A spec plist carries its fields through, re-canonicalized.
   (should (equal '(:file "d.kdbx" :keyfile nil :password nil :yubi "1:7")
                  (keepass-db-spec-normalize (keepass-make-db-spec
                                              :file "d.kdbx" :password nil
                                              :yubi "1:7"))))
+  ;; Key file, password and yubi may be functions, retained as-is.
+  (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")) (ys (lambda () "1:7")))
+    (should (equal (list :file "db.kdbx" :keyfile kf :password ps :yubi ys)
+                   (keepass-db-spec-normalize (keepass-make-db-spec
+                                               :file "db.kdbx" :keyfile kf
+                                               :password ps :yubi ys)))))
+  ;; The old positional list form is gone: a list that is not a spec plist
+  ;; (nor a string) is rejected, not mistranslated.
+  (should-error (keepass-db-spec-normalize '("db.kdbx" "k.txt" "pw")))
+  (should-error (keepass-db-spec-normalize '("db.kdbx" "k.txt")))
+  (should-error (keepass-db-spec-normalize '("db.kdbx")))
   ;; Garbage is rejected.
   (should-error (keepass-db-spec-normalize 42)))
 
@@ -602,14 +600,17 @@ from a string or from a function in the spec."
           (let ((password-cache-expiry nil))
             ;; Password as a string in the spec: no user prompt, key file
             ;; passed on every CLI call.
-            (let ((auth-sources (list (list db keyfile "KEYPW"))))
+            (let ((auth-sources (list (keepass-make-db-spec
+                                       :file db :keyfile keyfile :password "KEYPW"))))
               (let ((res (auth-source-search :host "kf.example" :user "me@kf"
                                              :port "465" :require '(:secret))))
                 (should (= 1 (length res)))
                 (should (equal "me@kf" (plist-get (car res) :user)))
                 (should (stringp (funcall (plist-get (car res) :secret))))))
             ;; Password as a function; same search still works.
-            (let ((auth-sources (list (list db keyfile (lambda () "KEYPW")))))
+            (let ((auth-sources (list (keepass-make-db-spec
+                                       :file db :keyfile keyfile
+                                       :password (lambda () "KEYPW")))))
               (let ((res (auth-source-search :host "kf.example" :user "me@kf"
                                              :port "465" :require '(:secret))))
                 (should (= 1 (length res))))))
@@ -617,7 +618,9 @@ from a string or from a function in the spec."
           ;; open is treated as a wrong credential, so the lookup raises
           ;; `user-error'.  (A distinct host avoids the auth-source success
           ;; cache from the earlier searches masking the failure.)
-          (let ((auth-sources (list (list db "/nonexistent-key.txt" "KEYPW"))))
+          (let ((auth-sources (list (keepass-make-db-spec
+                                     :file db :keyfile "/nonexistent-key.txt"
+                                     :password "KEYPW"))))
             (let ((password-cache-expiry nil))
               (should-error (auth-source-search :host "other.example" :user "me@kf"
                                                 :port "465" :require '(:secret))

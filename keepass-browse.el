@@ -68,40 +68,22 @@
   "List of KeePass databases available for browsing.
 Each element is a cons cell (NAME . SPEC), where NAME is a user-visible
 label shown by `keepass-browse-select-database', and SPEC is a database
-specification for `keepass-auth-source': a file name (string), a legacy
-positional list (PATH [KEYFILE] [PASSWORD]), or a keyword plist from
-`keepass-make-db-spec'.  See `keepass-db-spec-normalize'."
+specification for `keepass-auth-source': a file name (string) or a
+keyword plist from `keepass-make-db-spec'.  See
+`keepass-db-spec-normalize'."
   :type '(repeat (cons (string :tag "Name")
                        (choice (file :tag "Database file")
-                               (list :tag "Database spec (path [keyfile] [password])"
-                                     (file :tag "Path")
-                                     (choice (const :tag "No key file" nil)
-                                             (file :tag "Key file")
-                                             function)
-                                     (choice (const :tag "Prompt (ask user)" :prompt)
-                                             (const :tag "No password" nil)
-                                             (string :tag "Password")
-                                             function))
                                keepass-db-spec)))
   :group 'keepass-browse)
 
 (defcustom keepass-browse-database nil
   "The currently active KeePass database specification.
-Either a database file name (string), a legacy positional list (PATH
-[KEYFILE] [PASSWORD]), or a keyword plist from `keepass-make-db-spec',
-as understood by `keepass-auth-source'.  Set interactively with
-`keepass-browse-select-database'.  See `keepass-db-spec-normalize'."
+Either a database file name (string) or a keyword plist from
+`keepass-make-db-spec', as understood by `keepass-auth-source'.  Set
+interactively with `keepass-browse-select-database'.  See
+`keepass-db-spec-normalize'."
   :type '(choice (const :tag "None" nil)
                  (file :tag "Database file")
-                 (list :tag "Database spec (path [keyfile] [password])"
-                       (file :tag "Path")
-                       (choice (const :tag "No key file" nil)
-                               (file :tag "Key file")
-                               function)
-                       (choice (const :tag "Prompt (ask user)" :prompt)
-                               (const :tag "No password" nil)
-                               (string :tag "Password")
-                               function))
                  keepass-db-spec)
   :group 'keepass-browse)
 
@@ -1050,7 +1032,7 @@ actions (copy username/password, edit, ...).  Returns the chosen path."
 (defun keepass-browse--check-databases ()
   "Signal a clear error if `keepass-browse-databases' has the wrong shape.
 Each element must be a cons cell (NAME . SPEC): NAME is a string label and
-SPEC is a database file name or a (PATH [KEYFILE] [PASSWORD]) list."
+SPEC is a database file name or a `keepass-make-db-spec' plist."
   (unless (listp keepass-browse-databases)
     (user-error "`keepass-browse-databases' must be a list of (NAME . SPEC) \
 conses, got %S" keepass-browse-databases))

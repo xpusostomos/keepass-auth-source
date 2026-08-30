@@ -1,195 +1,512 @@
 * keepass-auth-source for emacs
+
 ** Introduction
-   This provides KeePass as an =auth-source= for emacs.  Once enabled, any
-   Emacs feature that uses =auth-source= ([[https://www.gnu.org/software/emacs/manual/html_node/efaq/][smtpmail]], =mu4e=, =erc=,
-   =forge=, ...) can read credentials from your KeePass database.
 
-   It talks to a KeePass database using one of two command-line backends:
+This repository contains two Emacs packages for working with [[https://keepass.info/][KeePass]]
+password databases ( =.kdbx= files):
 
-   - =keepassxc=  (default)  [[https://keepassxc.org/][KeePassXC]]'s =keepassxc-cli=, a cross-platform
-     client that works on GNU/Linux, macOS and Windows.
-   - =kpscript=              KeePass's [[https://keepass.info/plugins.html#kpscript][KPScript]], a *Windows-only* scripting
-     plugin that drives an installed [[https://keepass.info/][KeePass]].
+- =keepass-auth-source= -- gives Emacs features access to your KeePass
+  passwords.  Any Emacs package that fetches credentials through
+  =auth-source= (=smtpmail=, =mu4e=, =erc=, =forge=, ...) can read them
+  straight out of your KeePass database instead of a flat =.authinfo=
+  file.  This package sits underneath things you actually use: it is
+  invisible day-to-day, quietly supplying passwords when =auth-source=
+  asks for them.  It does nothing interactive -- no browsing, no editing.
 
-   The backend is chosen automatically by =keepass-auth-source-enable=,
-   preferring =keepassxc-cli= when it is available, and can be forced with
-   =keepass-auth-source-cli=.
-** Requirements
-   No Emacs packages are required (dash.el and s.el are no longer needed).
+- =keepass-browse= -- an all-singing, all-dancing KeePass browser and
+  editor for Emacs.  List entries, search by typing, view an entry with
+  its password hidden, copy any field (password, username, URL, notes,
+  TOTP) to the clipboard, and add, clone, edit or delete entries directly
+  in the database.  It is driven by =consult= and =embark= and is built
+  on top of =keepass-auth-source=, sharing its command-line backend,
+  master-password prompting/caching and error handling.
 
-   At least one of the following external programs must be on your =exec-path=:
+To choose a package, ask yourself what you want:
 
-   - =keepassxc-cli=  (cross-platform; recommended)
-   - =keepass= and =kpscript=  (Windows-only)
-** Installation
-   Add keepass-auth-source to your =load-path=.
-** Setup
-   1. Add =(require 'keepass-auth-source)= to your init file
-   2. Add =(keepass-auth-source-enable)= to your init file to enable using KeePass database files as an auth-source
+| You want...                                               | Use...                   |
+|-----------------------------------------------------------+--------------------------|
+| Emacs mail/ERC/etc. to log in using your KeePass entries  | =keepass-auth-source=    |
+| A KeePass client inside Emacs: search, view, copy, edit   | =keepass-browse=         |
 
-   #+BEGIN_SRC elisp
-     (require 'keepass-auth-source)
-     (keepass-auth-source-enable)
-     (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
-   #+END_SRC
+If you just want Emacs packages to use your passwords, only the
+=keepass-auth-source= section below matters.  If you also want a full
+KeePass client inside Emacs, read on to the =keepass-browse= section.
 
-   The auth-source will ask for the password for the kdbx file when trying to use it as an auth source.
-** How auth-source finds an entry: the canonical KeePass fields
-   =auth-source-search= is called by Emacs with a specification of *keys* like
-   =:host=, =:user=, =:port=, =:title= and so on.  keepass-auth-source maps those
-   onto the **five canonical KeePass entry fields** that =keepassxc-cli= can
-   actually search:
+Both packages talk to a database through one of two command-line
+backends:
 
-   | Canonical KeePass field | searched by keepassxc-cli as |
-   |--------------------------|-------------------------------|
-   | Title                    | =title:=                    |
-   | UserName                 | =user:=                     |
-   | Password                 | =password:=                 |
-   | URL                      | =url:=                      |
-   | Notes                    | =notes:=                    |
+- =keepassxc-cli=  (default)  [[https://keepassxc.org/][KeePassXC]]'s =keepassxc-cli=, a cross-platform
+  client that works on GNU/Linux, macOS and Windows.
+- =kpscript=              KeePass's [[https://keepass.info/plugins.html#kpscript][KPScript]], a *Windows-only* scripting
+  plugin that drives an installed [[https://keepass.info/][KeePass]].
 
-   An entry is only found if its canonical field *contains* the value you are
-   searching for.  For example, searching for =:host "smtp.gmail.com"= looks
-   in the **URL** field, and searching =:user "you@gmail.com"= looks in the
-   **UserName** field.
+The backend is chosen automatically by =keepass-auth-source-enable=,
+preferring =keepassxc-cli= when it is available, and can be forced with
+=keepass-auth-source-cli=.
 
-*** Aliases: how the auth-source keys map to the canonical fields
-   The auth-source keys are aliases for the canonical KeePass fields:
+** keepass-auth-source: credentials for Emacs packages
 
-   | auth-source key | maps to canonical field | keepassxc-cli term used |
-   |-----------------|-------------------------|-------------------------|
-   | =:host=         | URL                     | =url:HOST=             |
-   | =:host= + =:port= | URL                    | =url:HOST:PORT=       |
-   | =:user=         | UserName                | =user:USER=            |
-   | =:title=        | Title                   | =title:TITLE=          |
-   | =:password=     | Password                | =password:PASSWORD=    |
-   | =:notes=        | Notes                   | =notes:NOTES=          |
+*** Requirements
 
-   keepassxc-cli's =search= command ANDs together space-separated,
-   field-scoped terms, so when several keys are present they are combined
-   into a single query.  For example, searching =:host "smtp.gmail.com"
-   :user "you@gmail.com" :port 465= runs:
+No Emacs packages are required (dash.el and s.el are no longer needed).
+At least one of the following external programs must be on your
+=exec-path=:
 
-   #+BEGIN_SRC text
-     keepassxc-cli search <db> url:smtp.gmail.com:465 user:you@gmail.com
-   #+END_SRC
+- =keepassxc-cli=  (cross-platform; recommended)
+- =keepass= and =kpscript=  (Windows-only)
 
-   Terms match as substrings (no exact-match prefix) so this narrows down to
-   a small candidate set without assuming the caller passed any particular
-   combination of keys; the candidate set is then filtered precisely against
-   every key the caller did pass.  A search may therefore give only
-   =:host=, only =:user=, host+port, host+user, host+user+port, etc. —
-   whatever the caller chose to pass is what is matched.
+*** Installation
 
-   Custom attributes (for example a =host= or =port= *attribute* stored on an
-   entry) are *not* searchable by keepassxc-cli -- it can only search the five
-   canonical fields above.  To make a credential findable, store the server in
-   the URL field and the login in the UserName field.
-** Example: Gmail SMTP with smtpmail
-   A complete, working outgoing-mail setup:
+Add =keepass-auth-source= to your =load-path=.
 
-   #+BEGIN_SRC elisp
-     (require 'keepass-auth-source)
-     (keepass-auth-source-enable)
-     (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
+*** Setup
 
-     (setq send-mail-function        'smtpmail-send-it
-           message-send-mail-function 'smtpmail-send-it
-           smtpmail-smtp-server  "smtp.gmail.com"
-           smtpmail-smtp-service 465
-           smtpmail-stream-type  'ssl
-           smtpmail-smtp-user    "you@gmail.com"
-           user-mail-address     "you@gmail.com")
-   #+END_SRC
+1. Add =(require 'keepass-auth-source)= to your init file
+2. Add =(keepass-auth-source-enable)= to your init file to enable using
+   KeePass database files as an auth-source
+3. Add your database(s) to =auth-sources=
 
-   The matching KeePass entry must have its **URL** field set to
-   =smtp.gmail.com:465= and its **UserName** field set to =you@gmail.com=.
-   (If you omit the port from the search, the URL can just be =smtp.gmail.com=.)
+#+BEGIN_SRC elisp
+  (require 'keepass-auth-source)
+  (keepass-auth-source-enable)
+  (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
+#+END_SRC
 
-   Note that Gmail requires an [app
-   password](https://support.google.com/accounts/answer/185833), not your
-   account password.
-** Configuration
-*** Choosing a backend
-   By default the backend is auto-detected.  To force one:
+Each =auth-sources= entry is a *database spec*: either the database file
+name, or a keyword spec built with =keepass-make-db-spec= when you need a
+key file, a fixed password, a YubiKey or a passwordless database.  See
+[[The database spec]] below.
 
-   #+BEGIN_SRC elisp
-     (setq keepass-auth-source-cli 'keepassxc) ; keepassxc-cli (default, cross-platform)
-     (setq keepass-auth-source-cli 'kpscript)  ; KeePass KPScript (Windows)
-   #+END_SRC
+*** The database spec
 
-   The paths to each external program can also be customized:
+Every database used by this package -- in =auth-sources= or in
+=keepass-browse-databases= -- is one of two things:
 
-   - =keepass-auth-source-keepassxc-cli-program= (default =keepassxc-cli=)
-   - =keepass-auth-source-keepass-program=      (default =keepass=)
-   - =keepass-auth-source-kpscript-program=       (default =kpscript=)
+1. a database file name (a string): no key file, no YubiKey, and the
+   master password is requested when needed (the default);
+2. a keyword spec built with =keepass-make-db-spec=.
 
-   All of these are =defcustom=s and can be customized via
-   =M-x customize-variable=.
-*** Master-password cache expiry
-   KeePass database passwords are set to expire after two hours.  This can be
-   customized by setting =keepass-auth-source-cache-expiry= to any other value.
-   Set it to =nil= to never expire (the master password is then cached for the
-   rest of the Emacs session):
+=keepass-make-db-spec= takes keywords and returns a plain plist that the
+package reads through accessors like a struct, so the keywords can be
+given in any order:
 
-   #+BEGIN_SRC elisp
-     (setq keepass-auth-source-cache-expiry nil) ; never expire
-     (setq keepass-auth-source-cache-expiry 86400) ; one day
-   #+END_SRC
+#+BEGIN_SRC elisp
+  (keepass-make-db-spec :file   "~/passwords.kdbx")
+  ;;                          :keyfile "~/passwords.keyx"
+  ;;                          :password "swordfish"   ; or :prompt (default), nil, or a function
+  ;;                          :yubi     "1:7370001"
+#+END_SRC
 
-   This controls how often you are re-prompted for the KeePass database master
-   password.  Even with =nil=, you can force a re-prompt with <kbd>M-x</kbd>
-   =keepass-auth-source-forget-cached=.
-*** Verbose logging
-   To see every =keepassxc-cli= command the backend runs (useful for
-   debugging why a lookup narrows the way it does):
+The accepted keywords:
 
-   #+BEGIN_SRC elisp
-     (setq keepass-auth-source-verbose t)
-   #+END_SRC
+| keyword | meaning                                                                     |
+|---------+-----------------------------------------------------------------------------|
+| =:file= | the kdbx file path (string).  The only required keyword.                    |
+| =:keyfile= | the key file: a file name, a function returning one, or =nil=.          |
+| =:password= | the master password: a string, a function returning one, =:prompt= (ask the user), or =nil= (no master password).  Omitted means =:prompt=. |
+| =:yubi= | a YubiKey: a keepassxc-cli =slot[:serial]= string (e.g. ="1:7370001"=), a function returning one, or =nil= for none. |
 
-   Each invocation is logged to =*Messages*= and appended to a
-   =*keepass-auth-source-log*= buffer.
+A keyword value may be a *no-argument function* wherever a string is
+allowed (=:keyfile=, =:password=, =:yubi=) -- the function is called each
+time the value is needed, so you can fetch a password from a secret store
+or decrypt a key file on demand.
 
-   It is normal for a single action (such as sending mail) to trigger
-   *several* auth-source lookups, and therefore several keepassxc-cli
-   commands.  Emacs's TLS layer and application layers issue separate
-   searches with different specs.  For smtpmail specifically you will often
-   see two:
-     1. a host+port-only search (no user), driven by =network-stream-certificate=
-        looking up a TLS certificate for =host:port=, and
-     2. the actual credential search with host + user + port.
-   Both are legitimate; neither indicates a bug.
-*** Suppressing negative caching
-   =auth-source= normally remembers every search result -- including an empty
-   one -- for =auth-source-cache-expiry= seconds.  A single failure (the
-   database is locked, the password was wrong, =keepassxc-cli= was momentarily
-   unavailable) therefore keeps every later lookup returning nil long after
-   the cause is gone.
+For example, a database secured by both a key file and a YubiKey, whose
+password you want to be asked for, looks like:
 
-   By default keepass-auth-source installs advice so that empty results are
-   never cached, so a miss does not stick:
+#+BEGIN_SRC elisp
+  (keepass-make-db-spec :file "~/work.kdbx"
+                        :keyfile "~/work.keyx"
+                        :yubi "1:7370001")
+#+END_SRC
 
-   #+BEGIN_SRC elisp
-     (setq keepass-auth-source-suppress-negative-cache t) ; the default
-   #+END_SRC
-** Clearing the cache
-   If you change your KeePass database, change an entry, or re-configure,
-   a stale cached value can mask the change.  Run:
+and a passwordless database is spelled out with an explicit =nil= (note
+that omitting =:password= means *ask the user*, not *no password*):
 
-   - <kbd>M-x</kbd> =keepass-auth-source-forget-cached= -- forgets the cached
-     KeePass *master password*, so the next lookup re-prompts for it.  This
-     only touches keepass-auth-source's own cache.
-   - <kbd>M-x</kbd> =auth-source-forget-all-cached= -- clears the =auth-source=
-     search-result cache.  (This is called automatically by
-     =keepass-auth-source-enable=; use it if a *found* result is stale.)
-** Testing
-   Run the test suite with:
+#+BEGIN_SRC elisp
+  (keepass-make-db-spec :file "~/public.kdbx" :password nil)
+#+END_SRC
 
-   #+BEGIN_SRC sh
-     emacs -Q --batch -L . -l ert -l keepass-auth-source.el \
-            -l keepass-auth-source-test.el -f ert-run-tests-batch-and-exit
-   #+END_SRC
+Give the spec straight to =auth-source=, either by hand or by listing the
+database in =keepass-browse-databases= (see below):
 
-   The suite includes an integration test that builds a throwaway KeePassXC
-   database and queries it; it is skipped if =keepassxc-cli= is not present.
+#+BEGIN_SRC elisp
+  (add-to-list 'auth-sources
+               (keepass-make-db-spec :file "~/passwords.kdbx"))
+#+END_SRC
+
+=keepass-browse-databases= has a dedicated =M-x customize= interface
+(with a =keepass-db-spec= widget) covering both forms.  For =auth-sources=
+the plain file-name form is the easy one to customize; keyword specs are
+generally set with =setq=, as above.
+
+*** How auth-source finds an entry: the canonical KeePass fields
+
+=auth-source-search= is called by Emacs with a specification of *keys*
+like =:host=, =:user=, =:port=, =:title= and so on.  keepass-auth-source
+maps those onto the **five canonical KeePass entry fields** that
+=keepassxc-cli= can actually search:
+
+| Canonical KeePass field | searched by keepassxc-cli as |
+|--------------------------|-------------------------------|
+| Title                    | =title:=                     |
+| UserName                 | =user:=                      |
+| Password                 | =password:=                  |
+| URL                      | =url:=                       |
+| Notes                    | =notes:=                     |
+
+An entry is only found if its canonical field *contains* the value you
+are searching for.  For example, searching for =:host "smtp.gmail.com"=
+looks in the **URL** field, and searching =:user "you@gmail.com"= looks
+in the **UserName** field.
+
+**** Aliases: how the auth-source keys map to the canonical fields
+
+The auth-source keys are aliases for the canonical KeePass fields:
+
+| auth-source key | maps to canonical field | keepassxc-cli term used |
+|-----------------|-------------------------|-------------------------|
+| =:host=         | URL                     | =url:HOST=             |
+| =:user=         | UserName                | =user:USER=            |
+| =:title=        | Title                   | =title:TITLE=          |
+| =:password=     | Password                | =password:PASSWORD=    |
+| =:notes=        | Notes                   | =notes:NOTES=          |
+
+keepassxc-cli's =search= command ANDs together space-separated,
+field-scoped terms, so when several keys are present they are combined
+into a single query.  For example, searching =:host "smtp.gmail.com"
+:user "you@gmail.com" :port 465= runs:
+
+#+BEGIN_SRC text
+  keepassxc-cli search <db> url:smtp.gmail.com user:you@gmail.com
+#+END_SRC
+
+The port is deliberately left out of the keepassxc-cli term and enforced
+by the exact matcher instead: many entries store a bare host or a
+=smtp.gmail.com:465=-style URL, and folding the port into the substring
+search would exclude them before the matcher ever runs.
+
+Terms match as substrings (no exact-match prefix) so this narrows down to
+a small candidate set without assuming the caller passed any particular
+combination of keys; the candidate set is then filtered precisely against
+every key the caller did pass.  A search may therefore give only
+=:host=, only =:user=, host+port, host+user, host+user+port, etc. --
+whatever the caller chose to pass is what is matched.
+
+Custom attributes (for example a =host= or =port= *attribute* stored on
+an entry) are *not* searchable by keepassxc-cli -- it can only search the
+five canonical fields above.  To make a credential findable, store the
+server in the URL field and the login in the UserName field.
+
+*** Example: Gmail SMTP with smtpmail
+
+A complete, working outgoing-mail setup:
+
+#+BEGIN_SRC elisp
+  (require 'keepass-auth-source)
+  (keepass-auth-source-enable)
+  (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
+
+  (setq send-mail-function        'smtpmail-send-it
+        message-send-mail-function 'smtpmail-send-it
+        smtpmail-smtp-server  "smtp.gmail.com"
+        smtpmail-smtp-service 465
+        smtpmail-stream-type  'ssl
+        smtpmail-smtp-user    "you@gmail.com"
+        user-mail-address     "you@gmail.com")
+#+END_SRC
+
+The matching KeePass entry must have its **URL** field set to
+=smtp.gmail.com:465= and its **UserName** field set to
+=you@gmail.com=.  (If you omit the port from the search, the URL can just
+be =smtp.gmail.com=.)
+
+Note that Gmail requires an [app
+password](https://support.google.com/accounts/answer/185833), not your
+account password.
+
+*** Configuration
+
+**** Choosing a backend
+
+By default the backend is auto-detected.  To force one:
+
+#+BEGIN_SRC elisp
+  (setq keepass-auth-source-cli 'keepassxc) ; keepassxc-cli (default, cross-platform)
+  (setq keepass-auth-source-cli 'kpscript)  ; KeePass KPScript (Windows)
+#+END_SRC
+
+The paths to each external program can also be customized:
+
+- =keepass-auth-source-keepassxc-cli-program= (default =keepassxc-cli=)
+- =keepass-auth-source-keepass-program=      (default =keepass=)
+- =keepass-auth-source-kpscript-program=       (default =kpscript=)
+
+All of these are =defcustom=s and can be customized via
+=M-x customize-variable=.
+
+**** Master-password cache expiry
+
+KeePass database passwords are set to expire after two hours.  This can
+be customized by setting =keepass-auth-source-cache-expiry= to any other
+value.  Set it to =nil= to never expire (the master password is then
+cached for the rest of the Emacs session):
+
+#+BEGIN_SRC elisp
+  (setq keepass-auth-source-cache-expiry nil) ; never expire
+  (setq keepass-auth-source-cache-expiry 86400) ; one day
+#+END_SRC
+
+This controls how often you are re-prompted for the KeePass database
+master password.  Even with =nil=, you can force a re-prompt with
+<kbd>M-x</kbd> =keepass-auth-source-forget-cached=.
+
+**** Verbose logging
+
+To see every =keepassxc-cli= command the backend runs (useful for
+debugging why a lookup narrows the way it does):
+
+#+BEGIN_SRC elisp
+  (setq keepass-auth-source-verbose t)
+#+END_SRC
+
+Each invocation is logged to a =*keepass-auth-source-log*= buffer.
+
+It is normal for a single action (such as sending mail) to trigger
+*several* auth-source lookups, and therefore several =keepassxc-cli=
+commands.  Emacs's TLS layer and application layers issue separate
+searches with different specs.  For smtpmail specifically you will often
+see two:
+  1. a host+port-only search (no user), driven by
+     =network-stream-certificate= looking up a TLS certificate for
+     =host:port=, and
+  2. the actual credential search with host + user + port.
+
+Both are legitimate; neither indicates a bug.
+
+**** Suppressing negative caching
+
+=auth-source= normally remembers every search result -- including an
+empty one -- for =auth-source-cache-expiry= seconds.  A single failure
+(the database is locked, the password was wrong, =keepassxc-cli= was
+momentarily unavailable) therefore keeps every later lookup returning nil
+long after the cause is gone.
+
+By default keepass-auth-source installs advice so that empty results are
+never cached, so a miss does not stick:
+
+#+BEGIN_SRC elisp
+  (setq keepass-auth-source-suppress-negative-cache t) ; the default
+#+END_SRC
+
+*** Clearing the cache
+
+If you change your KeePass database, change an entry, or re-configure,
+a stale cached value can mask the change.  Run:
+
+- <kbd>M-x</kbd> =keepass-auth-source-forget-cached= -- forgets the cached
+  KeePass *master password*, so the next lookup re-prompts for it.  This
+  only touches keepass-auth-source's own cache.
+- <kbd>M-x</kbd> =auth-source-forget-all-cached= -- clears the
+  =auth-source= search-result cache.  (This is called automatically by
+  =keepass-auth-source-enable=; use it if a *found* result is stale.)
+
+** keepass-browse: a KeePass client inside Emacs
+
+=keepass-browse= lists the entries of a KeePass database, lets you pick
+one by typing, views it with the password hidden, and acts on it: copy
+any field to the clipboard, insert into the current buffer, or add,
+clone, edit and delete entries.  It uses =consult= (works with =vertico=)
+for selection and =embark= for the action menu, so if you already live in
+that ecosystem it fits right in.
+
+It deliberately reuses everything from =keepass-auth-source=: the same
+=keepassxc-cli= execution, the same master-password prompting/caching,
+and the same database specification.
+
+*** Requirements
+
+- =keepass-auth-source= (in this repository)
+- =consult=, =embark= and =embark-consult= -- installable from [[https://melpa.org/][MELPA]]
+  (embark-consult provides preview in the selection minibuffer)
+- =keepassxc-cli= on your =exec-path= (the browse features are built
+  around =keepassxc-cli=; the kpscript backend is not used for browsing)
+
+*** Installation
+
+Add both files to your =load-path= and require =keepass-browse=:
+
+#+BEGIN_SRC elisp
+  (require 'keepass-browse)
+#+END_SRC
+
+=keepass-browse= requires =keepass-auth-source= and pulls it in.
+
+*** Setup: tell it about your databases
+
+The one thing this package adds on top of =keepass-auth-source= is
+=keepass-browse-databases=: a *list* of =keepass-auth-source= database
+specs, each with a short name.  Every SPEC is any database specification
+-- a file name or a =keepass-make-db-spec= keyword plist, exactly as
+described in [[The database spec]] above:
+
+#+BEGIN_SRC elisp
+  (setq keepass-browse-databases
+        (list (cons "personal" "~/Google/AppData/KeePass/KeePassDB2.kdbx")
+              (cons "work" (keepass-make-db-spec
+                            :file "~/Google/AppData/KeePass/KeePassDB3.kdbx"
+                            :keyfile "~/work.keyx"
+                            :yubi "1:7370001"))))
+#+END_SRC
+
+Only a bare file name is a self-evaluating string, so a spec built with
+=keepass-make-db-spec= must appear outside a quoted list (as above), not
+inside ='()=.
+
+With several databases configured, the first command you run asks which
+one to use (=keepass-browse-select-database=); with exactly one it is
+selected automatically.  You can switch at any time with <kbd>M-x</kbd>
+=keepass-browse-select-database=.
+
+*** Using keepass-browse
+
+Two entry points:
+
+- <kbd>M-x</kbd> =keepass-browse= -- select an entry through the
+  minibuffer (consult/vertico completion; typing narrows).  RET runs the
+  default action (=keepass-browse-default-action=, by default *view*);
+  <kbd>C-.</kbd> opens the full action menu.
+
+- <kbd>M-x</kbd> =keepass-browse-buffer= -- a columned listing buffer of
+  every entry; move to a row and press <kbd>C-.</kbd> (=embark-act=) for
+  the action menu.
+
+From either one, the entry actions are:
+
+| key   | action                                |
+|-------+---------------------------------------|
+| =t=   | copy title                            |
+| =u=   | copy username                         |
+| =p=   | copy password                         |
+| =l=   | copy URL                              |
+| =n=   | copy notes                            |
+| =o=   | copy the current TOTP (if the entry has one) |
+| =v=   | view the entry (hide/show password)   |
+| =e=   | edit the entry                        |
+| =c=   | clone the entry                       |
+| =a=   | add a new entry in this group         |
+| =d=   | delete the entry                      |
+
+The selection minibuffer additionally offers =insert username= (=[P]=)
+and =insert password= (=[U]=) at point, and the =keepass-browse-insert-password=
+and =keepass-browse-insert-username= commands are available directly if
+you want to insert a password into your current buffer.
+
+**** The entry view
+
+=keepass-browse-view= shows an entry with its password hidden:
+
+#+BEGIN_SRC text
+  Title      My server
+  UserName   alice
+  Password   [hidden - press r]
+  URL        https://example.com
+  Notes      ...
+
+  [t] copy title     [c] clone
+  [u] copy username  [a] add
+  ...
+#+END_SRC
+
+Press =r= to reveal the password (which also copies it to the clipboard);
+=u=, =p=, =l=, =n=, =o= copy the corresponding field; =e= edits; =q=
+quits.  The key menu at the bottom shows all the bindings.
+
+**** Editing
+
+Add, clone, edit and delete are all done through =keepassxc-cli= write
+commands and take effect directly in the database:
+
+- *edit* is performed in place (the title may be changed without turning
+  the entry into a delete+add), so you never end up with Recycle-Bin
+  duplicates;
+- *add* and *clone* create a new entry in the selected entry's group;
+- *delete* asks for confirmation and moves the entry to the Recycle Bin
+  (the browse buffer excludes the Recycle Bin, so the entry disappears
+  from the listing).
+
+Every listing is read fresh from the database -- nothing is held in a
+cache -- so a change you make in keepass-browse shows up on the next
+listing (press =g= in the browse buffer, or just select again with
+=keepass-browse=, which always reads the database anew).  Changes made
+elsewhere (e.g. KeePassXC's GUI or a sync) are picked up the same way.
+
+**** Clipboard clearing
+
+=keepass-browse-clear-clipboard-seconds= (default 0, meaning off) clears
+the clipboard that many seconds after a copy, and only if the clipboard
+still holds the value you copied -- so it never wipes over what you paste
+in the meantime.
+
+**** Customization
+
+- =keepass-browse-fields= -- which canonical fields are shown in each
+  candidate line and in what order (default =("Title" "UserName" "URL")=).
+- =keepass-browse-default-action= -- what RET does after
+  =keepass-browse= selects an entry (default =keepass-browse-view=).
+- =keepass-browse-cache-expiry= -- master-password expiry for browsing
+  (default 7200 seconds; =nil= to never expire).
+- =keepass-browse-clear-clipboard-seconds= -- see above.
+
+All are =defcustom=s, adjustable with <kbd>M-x</kbd>
+=customize-variable= or <kbd>M-x</kbd> =customize-group= =keepass-browse=.
+
+*** Sharing databases with auth-source
+
+If you use both packages, tell auth-source about the databases you
+configured for browsing so email/ERC/etc. can use them too:
+
+#+BEGIN_SRC elisp
+  (keepass-browse-add-databases-to-auth-sources)
+#+END_SRC
+
+This appends each =SPEC= from =keepass-browse-databases= to
+=auth-sources= (skipping duplicates).
+
+** Tests
+
+An ERT test suite lives in =test/=.
+
+- =test/keepass-auth-source-test.el= covers the auth-source package:
+  parsing, term building, the host/user/port matcher, spec normalization,
+  negative-cache suppression -- plus integration tests that build a
+  throwaway KeePassXC database and search it for real.
+- =test/keepass-browse-test.el= covers browsing: parsing, field
+  extraction, and copy/edit/delete against a throwaway database.
+
+Run the auth-source suite with:
+
+#+BEGIN_SRC sh
+  emacs -Q --batch -L . -l ert -l keepass-auth-source.el \
+        -l test/keepass-auth-source-test.el -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+and the browse suite with:
+
+#+BEGIN_SRC sh
+  emacs -Q --batch -L . -l ert -l keepass-browse.el \
+        -l test/keepass-browse-test.el -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+The integration tests (and the browse suite generally) require
+=keepassxc-cli= on =exec-path=; they are skipped wholesale when it is
+missing, so both suites are safe to run on machines without KeePassXC.
+
+The browse suite also needs =consult=, =embark= and =embark-consult=
+findable (add their =elpa/= directories to =load-path=, as with a normal
+install), since =keepass-browse= requires them.
+
+** License and source
+
+GPL-3.0-or-later (see =LICENSE=).  Bug reports, feature requests and
+patches are welcome on the [[https://github.com/xpusostomos/keepass-auth-source][repository issue tracker]].
