@@ -14,11 +14,12 @@ password databases ( =.kdbx= files):
   asks for them.  It does nothing interactive -- no browsing, no editing.
 
 - =keepass-browse= -- an all-singing, all-dancing KeePass browser and
-  editor for Emacs.  List entries, search by typing, view an entry with
-  its password hidden, copy any field (password, username, URL, notes,
-  TOTP) to the clipboard, and add, clone, edit or delete entries directly
-  in the database.  It is driven by =consult= and =embark= and is built
-  on top of =keepass-auth-source=, sharing its command-line backend,
+  editor for Emacs.  List entries, search by typing, drill down through
+  the folder hierarchy group by group, view an entry with its password
+  hidden, copy any field (password, username, URL, notes, TOTP) to the
+  clipboard, and add, clone, edit or delete entries directly in the
+  database.  It is driven by =consult= and =embark= and is built on top
+  of =keepass-auth-source=, sharing its command-line backend,
   master-password prompting/caching and error handling.
 
 To choose a package, ask yourself what you want:
@@ -370,7 +371,7 @@ selected automatically.  You can switch at any time with <kbd>M-x</kbd>
 
 *** Using keepass-browse
 
-Two entry points:
+Three entry points:
 
 - <kbd>M-x</kbd> =keepass-browse= -- select an entry through the
   minibuffer (consult/vertico completion; typing narrows).  RET runs the
@@ -381,7 +382,15 @@ Two entry points:
   every entry; move to a row and press <kbd>C-.</kbd> (=embark-act=) for
   the action menu.
 
-From either one, the entry actions are:
+- <kbd>M-x</kbd> =keepass-browse-group= -- the same completion but
+  *group by group*: it starts at the database root (=/=) and completes
+  over the current group's subgroups and entries, so you drill down a
+  KeePass folder hierarchy one level at a time (=/=, then =Internet/=,
+  then =Google/=, then the entry you want) instead of narrowing a flat
+  list.  Choosing a subgroup descends; choosing an entry runs the same
+  =keepass-browse-default-action= as =keepass-browse=.
+
+From any of these, the entry actions are:
 
 | key   | action                                |
 |-------+---------------------------------------|

@@ -109,6 +109,96 @@
   (should-not (keepass-browse--valid-field-p "Uuid"))
   (should-not (keepass-browse--valid-field-p "host")))
 
+;;;; Group navigation helpers
+
+(ert-deftest keepass-browse-entry-directory-basename ()
+  "`entry-directory'/'entry-basename' split KeePass paths without TRAMP.
+A title like \"Apple:foo:bar\" gives path \"/Apple:foo:bar\", which any
+`file-name-*' function would hand to TRAMP (\"Method `Apple' is not
+known\").  The pure string helpers must never touch those."
+  (should (equal "/" (keepass-browse--entry-directory "/b")))
+  (should (equal "/a/" (keepass-browse--entry-directory "/a/b")))
+  (should (equal "/" (keepass-browse--entry-directory "/")))
+  (should (equal "" (keepass-browse--entry-directory "")))
+  (should (equal "/" (keepass-browse--entry-directory "/Apple:foo:bar")))
+  (should (equal "Apple:foo:bar" (keepass-browse--entry-basename "/Apple:foo:bar")))
+  (should (equal "b" (keepass-browse--entry-basename "/a/b")))
+  (should (equal "" (keepass-browse--entry-basename "/"))))
+
+(ert-deftest keepass-browse-group-contents-tramp-safe ()
+  "`group-contents' handles entry titles that look like TRAMP remote names."
+  (let ((entries '(("/Apple:foo:bar" . nil)
+                   ("/Internet/Apple:foo:bar" . nil)
+                   ("/Work/g" . nil))))
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/")))
+      ;; '/Apple:foo:bar' is a direct root entry, not a spurious subgroup.
+      (should (equal '("/Internet/" "/Work/") groups))
+      (should (equal '("/Apple:foo:bar") (mapcar #'car subs))))))
+
+(ert-deftest keepass-browse-group-contents ()
+  "`group-contents' splits entries into child groups and child entries."
+  (let ((entries '(("/Internet/Google/a" . nil)
+                   ("/Internet/Google/b" . nil)
+                   ("/Internet/Yahoo/c" . nil)
+                   ("/Work/g" . nil)
+                   ("/Root" . nil))))
+    ;; Root: subgroups /Internet/ + /Work/, direct entry /Root.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/")))
+      (should (equal '("/Internet/" "/Work/") groups))
+      (should (equal '("/Root") (mapcar #'car subs))))
+    ;; /Internet: subgroups /Internet/Google/ + /Internet/Yahoo/, no direct
+    ;; entries.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/Internet/")))
+      (should (equal '("/Internet/Google/" "/Internet/Yahoo/") groups))
+      (should (null subs)))
+    ;; Deepest group: two direct entries, no subgroups; group name without a
+    ;; trailing slash is normalized the same way.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/Internet/Google")))
+      (should (null groups))
+      (should (equal '("/Internet/Google/a" "/Internet/Google/b")
+                     (mapcar #'car subs))))))
+
+(ert-deftest keepass-browse-group-choose-drills-down ()
+  "`group-choose' descends through subgroups to reach an entry, recursing."
+  (let* ((entries '(("/Internet/Google/a" . (("Title" . "a")))))
+         (queue (list (keepass-browse--format-group "/Internet/")
+                      (keepass-browse--format-candidate
+                       "/Internet/Google/a" (cdar entries)))))
+    (cl-letf (((symbol-function 'consult--read)
+               (lambda (&rest _) (pop queue))))
+      (should (equal "/Internet/Google/a"
+                     (keepass-browse--group-choose entries "/"))))
+    (should (null queue))))
+
+(ert-deftest keepass-browse-group-command-picks-entry ()
+  "`keepass-browse-group' drills down and runs the default action on the entry."
+  (let* ((entries '(("/A/b" . nil)))
+         (queue (list (keepass-browse--format-group "/A/")
+                      (keepass-browse--format-candidate "/A/b" nil)))
+         (keepass-browse-database "db.kdbx")
+         (box (list nil))
+         (keepass-browse-default-action (lambda (p) (setcar box p))))
+    (cl-letf (((symbol-function 'keepass-browse--load-entries)
+               (lambda () entries))
+              ((symbol-function 'consult--read)
+               (lambda (&rest _) (pop queue))))
+      (should (equal "/A/b" (keepass-browse-group))))
+    (should (equal "/A/b" (car box)))))
+
+(ert-deftest keepass-browse-format-group-tags-path ()
+  "`format-group' shows the bare segment plus slash, tagged with the full path."
+  (let ((cand (keepass-browse--format-group "/Internet/")))
+    (should (equal "Internet/" cand))
+    (should (equal "/Internet/" (keepass-browse--path-of cand))))
+  ;; A nested group keeps its full path in the tag.
+  (should (equal "/Internet/Google/"
+                 (keepass-browse--path-of
+                  (keepass-browse--format-group "/Internet/Google/")))))
+
 ;;;; Integration tests (need keepassxc-cli)
 
 (ert-deftest keepass-browse-list-paths ()
@@ -119,6 +209,21 @@
       (should (member "/email" paths))
       (should (member "/Work/github" paths))
       (should (member "/Work/" groups)))))
+
+(ert-deftest keepass-browse-group-contents-real ()
+  "`group-contents' on a real database walks the group tree."
+  (keepass-browse-test-with-db
+    (let ((entries (keepass-browse--load-entries)))
+      ;; Root: the /Work group plus the top-level /email entry.
+      (pcase-let* ((`(,groups . ,subs)
+                    (keepass-browse--group-contents entries "/")))
+        (should (equal '("/Work/") groups))
+        (should (equal '("/email") (mapcar #'car subs))))
+      ;; /Work: only the nested github entry.
+      (pcase-let* ((`(,groups . ,subs)
+                    (keepass-browse--group-contents entries "/Work/")))
+        (should (null groups))
+        (should (equal '("/Work/github") (mapcar #'car subs)))))))
 
 (ert-deftest keepass-browse-entry-get-fields ()
   "`entry-get' returns the real fields for an entry."

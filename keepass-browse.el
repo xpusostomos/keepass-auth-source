@@ -396,6 +396,54 @@ behind the scenes; database changes made elsewhere are always visible."
                   (not (string-prefix-p "/Recycle Bin/" (car e))))
                 entries)))
 
+(defun keepass-browse--entry-directory (path)
+  "Return the directory part of KeePass entry PATH, trailing slash included.
+Examples: \"/a/b\" -> \"/a/\", \"/b\" -> \"/\", \"/\" -> \"/\", \"\" -> \"\".
+Pure string arithmetic: entry paths are record paths that just happen to
+look like file names, so they must never reach the `file-name-*' functions,
+which route through `file-name-handler-alist' -- and therefore through
+TRAMP -- hence a title such as \"Apple:foo:bar\" (path \"/Apple:foo:bar\")
+would raise \"Method `Apple' is not known\"."
+  (if (string-empty-p path)
+      ""
+    (let ((pos (string-match "/[^/]*\\'" path)))
+      (if pos (substring path 0 (1+ pos)) "/"))))
+
+(defun keepass-browse--entry-basename (path)
+  "Return the last path segment of KeePass entry PATH.
+Examples: \"/a/b\" -> \"b\", \"/b\" -> \"b\", \"/\" -> \"\".  Pure string
+arithmetic -- see `keepass-browse--entry-directory'."
+  (if (string-match "/[^/]*\\'" path)
+      (substring path (1+ (match-beginning 0)))
+    path))
+
+(defun keepass-browse--group-contents (entries group)
+  "Return the immediate children of GROUP in ENTRIES.
+ENTRIES is a list of (PATH . FIELDS) pairs as returned by
+`keepass-browse--load-entries'.  GROUP names a group: a path ending in
+\"/\" (e.g. \"/Internet/\"), or \"/\" for the root group; a missing
+trailing slash is added.  Returns (GROUPS . ENTRIES), where GROUPS is the
+list of child group paths (each ending in \"/\") and ENTRIES the child
+entry (PATH . FIELDS) pairs, both sorted by path."
+  (let* ((group (if (string-suffix-p "/" group) group (concat group "/")))
+         (in-group nil)
+         (subgroups nil))
+    (dolist (entry entries)
+      (let ((path (car entry)))
+        (when (string-equal (keepass-browse--entry-directory path) group)
+          (push entry in-group))
+        ;; A path strictly deeper than GROUP contributes its next segment as a
+        ;; subgroup; a direct child entry (rest has no "/") is just that.
+        (when (and (string-prefix-p group path)
+                   (string-match-p "/" (substring path (length group))))
+          (let* ((rest (substring path (length group)))
+                 (seg (car (split-string rest "/" t))))
+            (when (and seg (not (string-empty-p seg)))
+              (push (concat group seg "/") subgroups))))))
+    (cons (sort (delete-dups subgroups) #'string<)
+          (sort in-group
+                (lambda (a b) (string< (car a) (car b)))))))
+
 ;;; Candidates
 
 (defun keepass-browse--format-candidate (path entry)
@@ -405,6 +453,13 @@ behind the scenes; database changes made elsewhere are always visible."
                 (truncate-string-to-width (keepass-browse--field entry f)
                                           24 0 ?\s))
               keepass-browse-fields "\t")))
+    (put-text-property 0 (length str) 'kb-path path str)
+    str))
+
+(defun keepass-browse--format-group (path)
+  "Return a display string for group PATH, tagged with `kb-path'."
+  (let* ((trimmed (if (string-suffix-p "/" path) (substring path 0 -1) path))
+         (str (concat (keepass-browse--entry-basename trimmed) "/")))
     (put-text-property 0 (length str) 'kb-path path str)
     str))
 
@@ -735,10 +790,10 @@ group prefix) and the other fields, then commit with
   (interactive "sEntry path: ")
   (keepass-browse--require-db)
   (let* ((group (if (and target (not (string-blank-p target)))
-                    ;; Same group as the selected entry.  file-name
-                    ;; operations on a bare entry path are harmless here
-                    ;; (no remote-name syntax can arise from a clean path).
-                    (file-name-directory (concat "/" (string-trim-left target "/")))
+                    ;; Same group as the selected entry; pure string ops
+                    ;; only (see `keepass-browse--entry-directory').
+                    (keepass-browse--entry-directory
+                     (concat "/" (string-trim-left target "/")))
                   (keepass-browse--choose-group))))
     (keepass-browse--entry-open "*keepass-browse-add*" "add" nil
                                 (format "Title: %s\nUserName: \nPassword: \nURL: \nNotes: \n" group))))
@@ -755,7 +810,7 @@ The Title line holds the bare entry title; the full path is tracked in
 so editing does not become a spurious add/delete."
   (interactive "sEntry path: ")
   (let* ((entry (keepass-browse--entry-get path))
-         (title (file-name-nondirectory (directory-file-name path))))
+         (title (keepass-browse--entry-basename path)))
     (keepass-browse--entry-open "*keepass-browse-edit*" "edit" path
                                 (format "Title: %s\nUserName: %s\nPassword: %s\nURL: %s\nNotes: %s\n"
                                         title
@@ -817,7 +872,9 @@ duplicate.  A new entry uses `keepassxc-cli add'."
                       ;; via -t; the entry is at ORIGINAL.
                       original)
                      ;; add/clone: create under the original entry's group.
-                     (t (concat (if original (file-name-directory original) "")
+                     (t (concat (if original
+                                     (keepass-browse--entry-directory original)
+                                   "")
                                 (if (string-prefix-p "/" title) title title))))))
     (when (string-empty-p title)
       (user-error "Title may not be empty"))
@@ -851,7 +908,7 @@ duplicate.  A new entry uses `keepassxc-cli add'."
               ;; clone it is the newly created copy.
               (keepass-browse-view-refresh
                (if (string= action "edit")
-                   (concat (file-name-directory (or original "")) title)
+                   (concat (keepass-browse--entry-directory (or original "")) title)
                  path))
               (kill-buffer (current-buffer))
               (message "keepassxc-cli %s entry \"%s\"" cli title))
@@ -1028,6 +1085,56 @@ actions (copy username/password, edit, ...).  Returns the chosen path."
           (when keepass-browse-default-action
             (funcall keepass-browse-default-action path))
           path)))))
+
+(defun keepass-browse--group-choose (entries group)
+  "Drill down from GROUP, returning the chosen entry path or nil.
+ENTRIES is one database's ((PATH . FIELDS) ...) (already exported, so
+only a single keepassxc-cli call is made for the whole walk).  At each
+level the completion candidates are the current group's subgroups and
+entries; choosing a subgroup descends into it (recursively), choosing an
+entry returns its path.  Returns nil if a group turns out empty."
+  (let* ((contents (keepass-browse--group-contents entries group))
+         (groups (car contents))
+         (subentries (cdr contents)))
+    (if (and (null groups) (null subentries))
+        (progn (message "No entries under %s" group) nil)
+      (let* ((cands (append (mapcar #'keepass-browse--format-group groups)
+                            (mapcar (lambda (e)
+                                      (keepass-browse--format-candidate
+                                       (car e) (cdr e)))
+                                    subentries)))
+             (chosen (consult--read cands
+                                    :prompt (format "KeePass (%s): " group)
+                                    :history keepass-browse-history
+                                    :category 'keepass-browse
+                                    :require-match t
+                                    :sort nil
+                                    :lookup #'consult--lookup-member))
+             (path (keepass-browse--path-of chosen)))
+        (cond ((null path) (user-error "no path on candidate"))
+              ;; A trailing slash marks a group: descend into it.
+              ((string-suffix-p "/" path)
+               (keepass-browse--group-choose entries path))
+              (t path))))))
+
+;;;###autoload
+(defun keepass-browse-group (&optional path)
+  "Select a KeePass entry by navigating its group hierarchy.
+Start from GROUP (default \"/\", the root) and complete over each
+group's children one level at a time -- subgroups and entries -- until
+an entry is chosen; choosing a subgroup descends into it.  When an entry
+is picked, `keepass-browse-default-action' (by default
+`keepass-browse-view') runs on it, exactly as with `keepass-browse'.
+Returns the chosen entry path."
+  (interactive)
+  (keepass-browse--require-db)
+  (let ((keepass-browse--selecting t))
+    (let* ((path (or path "/"))
+           (entries (keepass-browse--load-entries))
+           (result (keepass-browse--group-choose entries path)))
+      (when (and result keepass-browse-default-action)
+        (funcall keepass-browse-default-action result))
+      result)))
 
 (defun keepass-browse--check-databases ()
   "Signal a clear error if `keepass-browse-databases' has the wrong shape.
