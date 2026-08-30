@@ -219,7 +219,7 @@ password."
 ;; representation could be swapped for a struct later without changing any
 ;; caller.
 
-(defconst keepass-db-spec-keys '(:file :keyfile :password :yubi)
+(defconst keepass-db-spec-keys '(:name :file :keyfile :password :yubi)
   "The keywords of a keepass database spec, in canonical order.")
 
 (define-widget 'keepass-db-spec 'plist
@@ -228,7 +228,8 @@ See `keepass-make-db-spec' for the meaning of each keyword.  The value
 type is a lenient catch-all (a value may be a string, a function, the
 symbol `:prompt', or nil) because which shape is valid depends on the
 keyword."
-  :key-type '(choice (const :file)
+  :key-type '(choice (const :name)
+                     (const :file)
                      (const :keyfile)
                      (const :password)
                      (const :yubi))
@@ -241,6 +242,9 @@ keyword."
   "Build a keepass database spec keyword plist from SPEC-PLIST.
 
 Accepted keywords (see `keepass-db-spec-keys'):
+  :name      a short, user-visible label for the database.  Used by
+             `keepass-browse' to name the database; omitted means the
+             file name is used where a name is shown.
   :file      the kdbx file path (string).  The only required keyword.
   :keyfile   the key file: a file name, a no-argument function returning
              one, or nil for none.
@@ -255,7 +259,8 @@ Accepted keywords (see `keepass-db-spec-keys'):
 An absent `:password' is NOT the same as an explicit nil -- nil means the
 database genuinely has no master password.  The result is returned in
 canonical key order so `equal' comparisons are order-independent."
-  (let* ((file (plist-get spec-plist :file))
+  (let* ((name (plist-get spec-plist :name))
+         (file (plist-get spec-plist :file))
          (keyfile (plist-get spec-plist :keyfile))
          (password (if (plist-member spec-plist :password)
                        (plist-get spec-plist :password)
@@ -274,7 +279,7 @@ canonical key order so `equal' comparisons are order-independent."
         (when tail (setq tail (cdr tail)))))
     (unless (stringp file)
       (user-error "keepass database spec requires a `:file' keyword"))
-    (list :file file :keyfile keyfile :password password :yubi yubi)))
+    (list :name name :file file :keyfile keyfile :password password :yubi yubi)))
 
 (defun keepass-db-spec-p (spec)
   "Return non-nil if SPEC is a keepass database spec keyword plist.
@@ -291,6 +296,11 @@ Lisp object."
            (setq tail (cdr tail))
            (when tail (setq tail (cdr tail))))
          ok)))
+
+(defun keepass-db-spec-name (spec)
+  "Return the user-visible name of database SPEC, or nil if absent.
+When nil, callers fall back to the database file name."
+  (plist-get spec :name))
 
 (defun keepass-db-spec-file (spec)
   "Return the kdbx file path of database spec SPEC."

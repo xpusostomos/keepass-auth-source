@@ -102,6 +102,7 @@ The accepted keywords:
 
 | keyword | meaning                                                                     |
 |---------+-----------------------------------------------------------------------------|
+| =:name= | a short, user-visible label for the database (used by =keepass-browse=).  Omitted means the file name is used. |
 | =:file= | the kdbx file path (string).  The only required keyword.                    |
 | =:keyfile= | the key file: a file name, a function returning one, or =nil=.          |
 | =:password= | the master password: a string, a function returning one, =:prompt= (ask the user), or =nil= (no master password).  Omitted means =:prompt=. |
@@ -346,23 +347,22 @@ Add both files to your =load-path= and require =keepass-browse=:
 *** Setup: tell it about your databases
 
 The one thing this package adds on top of =keepass-auth-source= is
-=keepass-browse-databases=: a *list* of =keepass-auth-source= database
-specs, each with a short name.  Every SPEC is any database specification
--- a file name or a =keepass-make-db-spec= keyword plist, exactly as
-described in [[The database spec]] above:
+=keepass-browse-databases=: a *list* of database spec plists (see
+[[The database spec]] above), each with an optional =:name= label that
+defaults to the file name.  A config is just a quoted list of plists:
 
 #+BEGIN_SRC elisp
   (setq keepass-browse-databases
-        (list (cons "personal" "~/Google/AppData/KeePass/KeePassDB2.kdbx")
-              (cons "work" (keepass-make-db-spec
-                            :file "~/Google/AppData/KeePass/KeePassDB3.kdbx"
-                            :keyfile "~/work.keyx"
-                            :yubi "1:7370001"))))
+        '((:name "personal" :file "~/Google/AppData/KeePass/KeePassDB2.kdbx")
+          (:name "work"     :file "~/Google/AppData/KeePass/KeePassDB3.kdbx"
+                 :keyfile "~/work.keyx"
+                 :yubi "1:7370001")))
 #+END_SRC
 
-Only a bare file name is a self-evaluating string, so a spec built with
-=keepass-make-db-spec= must appear outside a quoted list (as above), not
-inside ='()=.
+Since every entry is a plist, a plain quoted list works for most setups.
+If a value is a function (e.g. a =:password= that fetches from a secret
+store), build the list with =list= and =keepass-make-db-spec= instead, so
+the call is evaluated.
 
 With several databases configured, the first command you run asks which
 one to use (=keepass-browse-select-database=); with exactly one it is

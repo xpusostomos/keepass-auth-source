@@ -66,24 +66,20 @@
 
 (defcustom keepass-browse-databases nil
   "List of KeePass databases available for browsing.
-Each element is a cons cell (NAME . SPEC), where NAME is a user-visible
-label shown by `keepass-browse-select-database', and SPEC is a database
-specification for `keepass-auth-source': a file name (string) or a
-keyword plist from `keepass-make-db-spec'.  See
-`keepass-db-spec-normalize'."
-  :type '(repeat (cons (string :tag "Name")
-                       (choice (file :tag "Database file")
-                               keepass-db-spec)))
+Each element is a database spec plist as in `keepass-make-db-spec', with
+an optional `:name' label (defaulting to the file name when omitted).
+For example:
+
+  (setq keepass-browse-databases
+        \\='((:name \"personal\" :file \"~/passwords.kdbx\")
+            (:file \"~/work.kdbx\" :keyfile \"~/work.keyx\")))"
+  :type '(repeat keepass-db-spec)
   :group 'keepass-browse)
 
 (defcustom keepass-browse-database nil
-  "The currently active KeePass database specification.
-Either a database file name (string) or a keyword plist from
-`keepass-make-db-spec', as understood by `keepass-auth-source'.  Set
-interactively with `keepass-browse-select-database'.  See
-`keepass-db-spec-normalize'."
+  "The currently active KeePass database spec (a `keepass-make-db-spec'
+plist).  Set interactively with `keepass-browse-select-database'."
   :type '(choice (const :tag "None" nil)
-                 (file :tag "Database file")
                  keepass-db-spec)
   :group 'keepass-browse)
 
@@ -654,13 +650,17 @@ menu is only shown when already viewing an entry."
               rows)))
     (concat "\n\n" (string-join (nreverse rows) "\n"))))
 
+(defun keepass-browse--spec-label (spec)
+  "Return a user-visible label for database spec SPEC.
+The spec's `:name', or the file name for a spec without one."
+  (let ((spec (keepass-db-spec-normalize spec)))
+    (or (keepass-db-spec-name spec)
+        (file-name-nondirectory (keepass-db-spec-file spec)))))
+
 (defun keepass-browse--database-name ()
-  "Return the user-visible name of the active database, or nil.
-The name is the `car' of the (NAME . SPEC) entry in
-`keepass-browse-databases' whose spec is the active one.  Returns nil when
-the databases list is empty or when the active spec has no matching entry."
-  (let ((spec keepass-browse-database))
-    (car (cl-find spec keepass-browse-databases :key #'cdr :test #'equal))))
+  "Return the user-visible name of the active database, or nil."
+  (when keepass-browse-database
+    (keepass-browse--spec-label keepass-browse-database)))
 
 (defun keepass-browse-view-update (reveal)
   "Redraw the current view buffer, revealing the password when REVEAL.
@@ -1284,16 +1284,14 @@ Returns the chosen entry path."
 
 (defun keepass-browse--check-databases ()
   "Signal a clear error if `keepass-browse-databases' has the wrong shape.
-Each element must be a cons cell (NAME . SPEC): NAME is a string label and
-SPEC is a database file name or a `keepass-make-db-spec' plist."
+Each element must be a database spec plist (see `keepass-db-spec-p')."
   (unless (listp keepass-browse-databases)
-    (user-error "`keepass-browse-databases' must be a list of (NAME . SPEC) \
-conses, got %S" keepass-browse-databases))
+    (user-error "`keepass-browse-databases' must be a list of database spec \
+plists, got %S" keepass-browse-databases))
   (dolist (entry keepass-browse-databases)
-    (unless (and (consp entry)
-                 (stringp (car entry)))
+    (unless (keepass-db-spec-p entry)
       (user-error "Each element of `keepass-browse-databases' must be a \
-(NAME . SPEC) cons; got %S" entry))))
+database spec plist such as (:file \"...\") ; got %S" entry))))
 
 (defun keepass-browse--ensure-database ()
   "Make sure a database is selected.
@@ -1304,36 +1302,44 @@ if it has several and the user has not picked one yet, prompt them with
   (keepass-browse--check-databases)
   (unless keepass-browse-database
     (if (= 1 (length keepass-browse-databases))
-        (setq keepass-browse-database (cdar keepass-browse-databases))
+        (setq keepass-browse-database (car keepass-browse-databases))
       (keepass-browse-select-database)))
   keepass-browse-database)
 
 ;;;###autoload
 (defun keepass-browse-select-database ()
-  "Select the active KeePass database from `keepass-browse-databases'."
+  "Select the active KeePass database from `keepass-browse-databases'.
+Completes over each entry's label (its `:name', or the file name)."
   (interactive)
   (keepass-browse--check-databases)
   (unless keepass-browse-databases
     (user-error "`keepass-browse-databases' is empty -- add your databases first"))
-  (let* ((names (mapcar #'car keepass-browse-databases))
-         (chosen (completing-read "KeePass database: " names nil t)))
-    (setq keepass-browse-database
-          (cdr (assoc chosen keepass-browse-databases)))
+  (let* ((entries keepass-browse-databases)
+         (labels (mapcar #'keepass-browse--spec-label entries))
+         (chosen (completing-read "KeePass database: " labels nil t))
+         (entry (car (seq-filter (lambda (e)
+                                   (string= chosen (keepass-browse--spec-label e)))
+                                 entries))))
+    (setq keepass-browse-database entry)
     (message "Using KeePass database %s" chosen)
     keepass-browse-database))
 
 ;;;###autoload
 (defun keepass-browse-add-databases-to-auth-sources ()
   "Add every database spec in `keepass-browse-databases' to `auth-sources'.
-Each entry's SPEC (the `cdr' of the (NAME . SPEC) cons) is appended to
-`auth-sources' so `keepass-auth-source' can search all of them.  Call
-after setting `keepass-browse-databases' and before/after
-`keepass-auth-source-enable'."
+Each entry is appended to `auth-sources' (without its browse-only `:name')
+so `keepass-auth-source' can search all of them.  Call after setting
+`keepass-browse-databases' and before/after `keepass-auth-source-enable'."
   (interactive)
   (dolist (entry keepass-browse-databases)
-    (let ((spec (cdr entry)))
-      (unless (member spec auth-sources)
-        (setq auth-sources (append auth-sources (list spec)))))))
+    (let* ((spec (keepass-db-spec-normalize entry))
+           (auth-spec (keepass-make-db-spec
+                       :file (keepass-db-spec-file spec)
+                       :keyfile (keepass-db-spec-keyfile spec)
+                       :password (keepass-db-spec-password spec)
+                       :yubi (keepass-db-spec-yubi spec))))
+      (unless (member auth-spec auth-sources)
+        (setq auth-sources (append auth-sources (list auth-spec)))))))
 
 (provide 'keepass-browse)
 ;;; keepass-browse.el ends here

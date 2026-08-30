@@ -50,7 +50,7 @@
   "Bind a fresh test DB and run BODY with it set as the active database."
   `(when keepass-browse-test-program
      (let* ((db (keepass-browse-test-make-db))
-            (keepass-browse-database db)
+            (keepass-browse-database (keepass-make-db-spec :file db))
             (keepass-browse-cache-expiry nil)
             (password-cache-expiry nil))
        (password-cache-add db "PASS")
@@ -115,6 +115,37 @@
       (should (equal "/Work/" (cdr (assoc "Group" entry))))
       (should (equal "t" (cdr (assoc "Title" entry))))
       (should (equal "u" (cdr (assoc "UserName" entry)))))))
+
+(ert-deftest keepass-browse-spec-label ()
+  "A database spec's label is its :name, defaulting to the file name."
+  (should (equal "mydb" (keepass-browse--spec-label '(:name "mydb" :file "/p/db.kdbx"))))
+  (should (equal "db.kdbx" (keepass-browse--spec-label '(:file "/path/db.kdbx"))))
+  (should (equal "db.kdbx" (keepass-browse--spec-label "db.kdbx"))))
+
+(ert-deftest keepass-browse-select-database-by-label ()
+  "Selecting a database completes over labels and sets a plist spec."
+  (let* ((keepass-browse-databases
+          '((:name "work" :file "/a/work.kdbx")
+            (:file "/b/personal.kdbx")))
+         (keepass-browse-database nil))
+    (let ((result
+           (cl-letf (((symbol-function 'completing-read)
+                      (lambda (_prompt coll &rest _) (car coll))))
+             (keepass-browse-select-database))))
+      ;; The first label is "work"; the matching entry is the whole plist.
+      (should (equal '(:name "work" :file "/a/work.kdbx") result))
+      (should (equal result keepass-browse-database)))))
+
+(ert-deftest keepass-browse-add-databases-to-auth-sources-strips-name ()
+  "Adding the databases to auth-sources drops the browse-only :name."
+  (let* ((keepass-browse-databases
+          '((:name "work" :file "/a/work.kdbx" :keyfile "/a/k")))
+         (auth-sources nil))
+    (keepass-browse-add-databases-to-auth-sources)
+    (should (equal 1 (length auth-sources)))
+    (should (equal "/a/work.kdbx" (keepass-db-spec-file (car auth-sources))))
+    (should-not (keepass-db-spec-name (car auth-sources)))
+    (should (equal "/a/k" (keepass-db-spec-keyfile (car auth-sources))))))
 
 (ert-deftest keepass-browse-entry-mode-map-bindings ()
   "The entry-mode keymap binds group-choosing to `C-c C-p'.
@@ -303,7 +334,7 @@ known\").  The pure string helpers must never touch those."
   (let* ((entries '(("/A/b" . nil)))
          (queue (list (keepass-browse--format-group "/A/")
                       (keepass-browse--format-candidate "/A/b" nil)))
-         (keepass-browse-database "db.kdbx")
+         (keepass-browse-database (keepass-make-db-spec :file "db.kdbx"))
          (box (list nil))
          (keepass-browse-default-action (lambda (p) (setcar box p))))
     (cl-letf (((symbol-function 'keepass-browse--load-entries)
@@ -438,8 +469,10 @@ the old path is gone."
 (ert-deftest keepass-browse-wrong-password-errors ()
   "A wrong master password raises an error, not a silent empty result."
   (keepass-browse-test-with-db
+    ;; The password cache is keyed by the database *path*, so override the
+    ;; good entry with a wrong password under that key.
     (let ((password-cache-expiry nil))
-      (password-cache-add keepass-browse-database "WRONG"))
+      (password-cache-add (keepass-browse--database-path) "WRONG"))
     (should-error (keepass-browse--load-entries) :type 'error)))
 
 (ert-deftest keepass-browse-copy-totp-absent ()

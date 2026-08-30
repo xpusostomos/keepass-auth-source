@@ -399,19 +399,21 @@ A search must return all entries that match *every* key given, and only them."
   "`keepass-make-db-spec' builds a canonical keyword plist.
 An omitted `:password' is NOT an explicit nil: the latter means a
 database with no master password, while omission means `:prompt'."
-  ;; All fields given; canonical key order is :file :keyfile :password :yubi.
-  (should (equal '(:file "db.kdbx" :keyfile "k.txt" :password "pw" :yubi "1:7370001")
+  ;; All fields given; canonical key order is :name :file :keyfile :password :yubi.
+  (should (equal '(:name "mydb" :file "db.kdbx" :keyfile "k.txt" :password "pw" :yubi "1:7370001")
                  (keepass-make-db-spec :password "pw" :yubi "1:7370001"
-                                       :file "db.kdbx" :keyfile "k.txt")))
+                                       :name "mydb" :file "db.kdbx"
+                                       :keyfile "k.txt")))
   ;; Password omitted -> :prompt.
   (should (equal :prompt
                  (plist-get (keepass-make-db-spec :file "db.kdbx") :password)))
   ;; Password explicitly nil -> nil (genuinely no master password).
   (should (eq nil (plist-get (keepass-make-db-spec :file "db.kdbx" :password nil)
                              :password)))
-  ;; Keyfile and yubi default to nil.
+  ;; Keyfile, yubi and name default to nil.
   (should-not (plist-get (keepass-make-db-spec :file "db.kdbx") :keyfile))
   (should-not (plist-get (keepass-make-db-spec :file "db.kdbx") :yubi))
+  (should-not (plist-get (keepass-make-db-spec :file "db.kdbx") :name))
   ;; Unknown keywords are rejected up front.
   (should-error (keepass-make-db-spec :file "db" :bogus 1))
   ;; A spec must spell out a :file.
@@ -422,6 +424,7 @@ database with no master password, while omission means `:prompt'."
   (should (keepass-db-spec-p
            (keepass-make-db-spec :file "db.kdbx" :password nil)))
   (should (keepass-db-spec-p '(:file "db.kdbx")))
+  (should (keepass-db-spec-p '(:name "mydb" :file "db.kdbx")))
   ;; A positional list, a string, and a plist with an unknown keyword aren't.
   (should-not (keepass-db-spec-p "db.kdbx"))
   (should-not (keepass-db-spec-p '("db.kdbx" "k.txt")))
@@ -434,7 +437,8 @@ database with no master password, while omission means `:prompt'."
   (let* ((kf (lambda () "k.txt"))
          (ps (lambda () "pw"))
          (spec (keepass-make-db-spec :file "db.kdbx" :keyfile kf
-                                     :password ps :yubi "1:7")))
+                                     :password ps :yubi "1:7" :name "mydb")))
+    (should (equal "mydb" (keepass-db-spec-name spec)))
     (should (equal "db.kdbx" (keepass-db-spec-file spec)))
     (should (eq kf (keepass-db-spec-keyfile spec)))
     (should (eq ps (keepass-db-spec-password spec)))
@@ -443,16 +447,21 @@ database with no master password, while omission means `:prompt'."
 (ert-deftest keepass-db-spec-normalize ()
   "A string or spec plist normalizes to the canonical plist."
   ;; Plain string: canonical plist, password = :prompt.
-  (should (equal '(:file "db.kdbx" :keyfile nil :password :prompt :yubi nil)
+  (should (equal '(:name nil :file "db.kdbx" :keyfile nil :password :prompt :yubi nil)
                  (keepass-db-spec-normalize "db.kdbx")))
   ;; A spec plist carries its fields through, re-canonicalized.
-  (should (equal '(:file "d.kdbx" :keyfile nil :password nil :yubi "1:7")
+  (should (equal '(:name nil :file "d.kdbx" :keyfile nil :password nil :yubi "1:7")
                  (keepass-db-spec-normalize (keepass-make-db-spec
                                              :file "d.kdbx" :password nil
                                              :yubi "1:7"))))
+  ;; A :name survives normalization.
+  (should (equal "mydb"
+                 (keepass-db-spec-name
+                  (keepass-db-spec-normalize (keepass-make-db-spec
+                                              :file "db.kdbx" :name "mydb")))))
   ;; Key file, password and yubi may be functions, retained as-is.
   (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")) (ys (lambda () "1:7")))
-    (should (equal (list :file "db.kdbx" :keyfile kf :password ps :yubi ys)
+    (should (equal (list :name nil :file "db.kdbx" :keyfile kf :password ps :yubi ys)
                    (keepass-db-spec-normalize (keepass-make-db-spec
                                                :file "db.kdbx" :keyfile kf
                                                :password ps :yubi ys)))))
