@@ -397,33 +397,35 @@ A search must return all entries that match *every* key given, and only them."
 
 (ert-deftest keepass-auth-source-normalize-db ()
   "A string or list DB spec normalizes to (PATH KEYFILE PASSWORD)."
-  ;; Plain string: no keyfile, password = prompt (nil).
-  (should (equal '("db.kdbx" nil nil)
+  ;; Plain string: no keyfile, password = prompt (:prompt).
+  (should (equal '("db.kdbx" nil :prompt)
                  (keepass-auth-source--normalize-db "db.kdbx")))
   ;; (PATH KEYFILE PASSWORD): all present.
   (should (equal '("db.kdbx" "k.txt" "pw")
                  (keepass-auth-source--normalize-db '("db.kdbx" "k.txt" "pw"))))
-  ;; (PATH KEYFILE): password = nil (prompt).
-  (should (equal '("db.kdbx" "k.txt" nil)
+  ;; (PATH KEYFILE): password absent = prompt (:prompt).
+  (should (equal '("db.kdbx" "k.txt" :prompt)
                  (keepass-auth-source--normalize-db '("db.kdbx" "k.txt"))))
+  ;; (PATH KEYFILE nil): password present-but-nil = no password (nil).
+  (should (equal '("db.kdbx" "k.txt" nil)
+                 (keepass-auth-source--normalize-db '("db.kdbx" "k.txt" nil))))
   ;; Key file and password may be functions, retained as-is.
   (let ((kf (lambda () "k.txt")) (ps (lambda () "pw")))
     (should (equal (list "db.kdbx" kf ps)
                    (keepass-auth-source--normalize-db (list "db.kdbx" kf ps))))))
 
 (ert-deftest keepass-auth-source-resolve-keyfile-password ()
-  "Key file and password specs accept strings, functions and nil."
+  "Key file and password specs accept strings, functions, :prompt and nil."
   ;; Key file: string stays, function is called, nil is nil.
   (should (equal "k.txt" (keepass-auth-source--resolve-keyfile "k.txt")))
   (should (equal "k.txt" (keepass-auth-source--resolve-keyfile (lambda () "k.txt"))))
   (should-not (keepass-auth-source--resolve-keyfile nil))
-  ;; Password: string stays, function is called, nil means prompt (cached).
+  ;; Password: string stays, function is called.
   (should (equal "pw" (keepass-auth-source--resolve-password "pw" "db")))
   (should (equal "pw" (keepass-auth-source--resolve-password (lambda () "pw") "db")))
-  (let ((password-cache-expiry nil))
-    (password-cache-add "resolvedb" "cachedpw")
-    (should (equal "cachedpw"
-                   (keepass-auth-source--resolve-password nil "resolvedb")))))
+  ;; nil means NO password, reported as the `:no-password' sentinel.
+  (should (eq :no-password
+              (keepass-auth-source--resolve-password nil "nopwdb"))))
 
 ;;;; Negative-cache suppression
 

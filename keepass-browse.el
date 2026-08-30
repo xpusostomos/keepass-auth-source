@@ -216,6 +216,30 @@ A string or function in the spec is used as-is; nil prompts the user via
 Deprecated alias kept for call-site clarity; use `keepass-browse--db-password'."
   (keepass-browse--db-password))
 
+(defun keepass-browse--run (password &rest args)
+  "Run keepassxc-cli with ARGS on the active database.
+PASSWORD is the resolved master password, or `:no-password' for a
+passwordless database (which gets keepassxc-cli's --no-password global
+option and no stdin).  Looks up the key file from the active spec."
+  (apply #'keepass-auth-source--keepassxc-run
+         password
+         (append (keepass-auth-source--no-password-flag password)
+                 (keepass-browse--db-keyfile)
+                 args)))
+
+(defun keepass-browse--run-stdin (password stdin &rest args)
+  "Run keepassxc-cli with ARGS and STDIN, e.g. an entry edit or add.
+STDIN already contains the database password (or nothing for a
+passwordless DB) plus the entry's password, as required by
+`keepass-auth-source--keepassxc-run-stdin'.  PASSWORD is the database's
+resolved master password (possibly `:no-password')."
+  (apply #'keepass-auth-source--keepassxc-run-stdin
+         stdin
+         password
+         (keepass-auth-source--no-password-flag password)
+         (keepass-browse--db-keyfile)
+         args))
+
 (defun keepass-browse--error (output)
   "Signal an error describing a failed keepassxc-cli run (OUTPUT)."
   (keepass-auth-source--error output (keepass-browse--database-path)))
@@ -251,11 +275,9 @@ no caching, so database changes made elsewhere (e.g. Google Drive sync) are
 always seen."
   (setq path (or (keepass-browse--path-of path) path))
   (let* ((db (keepass-browse--database-path))
-         (run (apply #'keepass-auth-source--keepassxc-run
-                     (keepass-browse--db-password)
-                     (append (list "show" "--quiet" "--show-protected")
-                             (keepass-browse--db-keyfile)
-                             (list db path)))))
+         (pw (keepass-browse--db-password))
+         (run (apply #'keepass-browse--run pw
+                     (list "show" "--quiet" "--show-protected" db path))))
     (if (eq (cdr run) 0)
         (keepass-browse--parse-show (car run))
       (keepass-browse--error (car run)))))
@@ -268,11 +290,9 @@ always seen."
   "Return the list of entry paths (excluding group rows) in the database.
 Reads freshly from keepassxc-cli, with no caching."
   (let* ((db (keepass-browse--database-path))
-         (run (apply #'keepass-auth-source--keepassxc-run
+         (run (apply #'keepass-browse--run
                      (keepass-browse--db-password)
-                     (append (list "ls" "--quiet" "--recursive" "--flatten")
-                             (keepass-browse--db-keyfile)
-                             (list db)))))
+                     (list "ls" "--quiet" "--recursive" "--flatten" db))))
     (unless (eq (cdr run) 0)
       (keepass-browse--error (car run)))
     (let ((paths (seq-filter (lambda (s)
@@ -286,11 +306,9 @@ Reads freshly from keepassxc-cli, with no caching."
   "Return the list of group paths (each ending in /) in the database.
 Reads freshly from keepassxc-cli, with no caching."
   (let* ((db (keepass-browse--database-path))
-         (run (apply #'keepass-auth-source--keepassxc-run
+         (run (apply #'keepass-browse--run
                      (keepass-browse--db-password)
-                     (append (list "ls" "--quiet" "--recursive" "--flatten")
-                             (keepass-browse--db-keyfile)
-                             (list db)))))
+                     (list "ls" "--quiet" "--recursive" "--flatten" db))))
     (unless (eq (cdr run) 0)
       (keepass-browse--error (car run)))
     (mapcar (lambda (g) (if (string-prefix-p "/" g) g (concat "/" g)))
@@ -301,11 +319,9 @@ Reads freshly from keepassxc-cli, with no caching."
   "Return the export XML node tree for the database.
 Does ONE `keepassxc-cli export' call so the whole database (all entries,
 all fields, passwords included) is fetched up front, freshly each time."
-  (let ((run (apply #'keepass-auth-source--keepassxc-run
+  (let ((run (apply #'keepass-browse--run
                     (keepass-browse--db-password)
-                    (append (list "export" "--quiet")
-                            (keepass-browse--db-keyfile)
-                            (list (keepass-browse--database-path))))))
+                    (list "export" "--quiet" (keepass-browse--database-path)))))
     (unless (eq (cdr run) 0)
       (keepass-browse--error (car run)))
     (with-temp-buffer
@@ -422,11 +438,10 @@ that merely looks similar cannot resolve to the wrong entry."
 (defun keepass-browse--totp (path)
   "Return the current TOTP for the entry at PATH, or nil."
   (setq path (or (keepass-browse--path-of path) path)) ; resolve padded target
-  (let ((run (apply #'keepass-auth-source--keepassxc-run
+  (let ((run (apply #'keepass-browse--run
                     (keepass-browse--db-password)
-                    (append (list "show" "--quiet" "--totp")
-                            (keepass-browse--db-keyfile)
-                            (list (keepass-browse--database-path) path)))))
+                    (list "show" "--quiet" "--totp"
+                          (keepass-browse--database-path) path))))
     (when (eq (cdr run) 0)
       (string-trim (car run)))))
 
@@ -758,11 +773,9 @@ so editing does not become a spurious add/delete."
   ;; are used as-is.
   (unless (string-prefix-p "/" (or path ""))
     (setq path (keepass-browse--path-of path)))
-  (let ((run (apply #'keepass-auth-source--keepassxc-run
+  (let ((run (apply #'keepass-browse--run
                     (keepass-browse--db-password)
-                    (append (list "rm" "--quiet")
-                            (keepass-browse--db-keyfile)
-                            (list (keepass-browse--database-path) path)))))
+                    (list "rm" "--quiet" (keepass-browse--database-path) path))))
     (if (eq (cdr run) 0)
         (progn
           ;; If the deleted entry is displayed in the view buffer, close it --
@@ -801,27 +814,28 @@ duplicate.  A new entry uses `keepassxc-cli add'."
                                 (if (string-prefix-p "/" title) title title))))))
     (when (string-empty-p title)
       (user-error "Title may not be empty"))
-    (let* ((stdin (concat (keepass-browse--db-password) "\n"
-                          password "\n"))
+    (let* ((dbpw (keepass-browse--db-password))
+           ;; keepassxc-cli reads the database password then (with -p) the
+           ;; entry password from stdin.  For a passwordless DB there is no
+           ;; database password line; --no-password tells keepassxc-cli so.
+           (stdin (if (eq dbpw :no-password)
+                      (concat password "\n")
+                    (concat dbpw "\n" password "\n")))
            (cli (if (string= action "edit") "edit" "add"))
            ;; `-t' (title) exists only on `edit'; for `add' the title is part
            ;; of the entry path and is not passed separately.  Global options
-           ;; (`--key-file') come after the subcommand and before the
-           ;; positional database argument.
+           ;; (`--no-password', `--key-file') come after the subcommand and
+           ;; before the positional database argument.
            (db (keepass-browse--database-path))
            (common (append (list "-u" (keepass-browse--field entry "UserName")
                                  "--url" (keepass-browse--field entry "URL")
                                  "--notes" (keepass-browse--field entry "Notes")
                                  "-p")))
+           (global (append (keepass-auth-source--no-password-flag dbpw)
+                           (keepass-browse--db-keyfile)))
            (args (if (string= action "edit")
-                     (append (list cli)
-                             (keepass-browse--db-keyfile)
-                             (list db path "-t" title)
-                             common)
-                   (append (list cli)
-                           (keepass-browse--db-keyfile)
-                           (list db path)
-                           common))))
+                     (append (list cli) global (list db path "-t" title) common)
+                   (append (list cli) global (list db path) common))))
       (let ((run (apply #'keepass-auth-source--keepassxc-run-stdin stdin args)))
         (if (eq (cdr run) 0)
             (progn

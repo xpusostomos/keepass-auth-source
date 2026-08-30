@@ -211,27 +211,59 @@ password."
 (defun keepass-auth-source--normalize-db (spec)
   "Normalize a database SPEC to (PATH KEYFILE PASSWORD).
 
-SPEC is one `auth-sources' entry (or the value of
-`keepass-browse-database-file').  It is either a string -- the database
-path, with no key file and an interactively-requested password -- or a
-list:
+SPEC is one `auth-sources' entry (or `keepass-browse-database').  It is
+either a string -- the database path, with no key file and an
+interactively-requested password -- or a list:
 
   (PATH [KEYFILE] [PASSWORD])
 
 PATH is the database file name.  KEYFILE, if present and non-nil, is
 either a string (the key file's name) or a function of no arguments
-returning the file name; nil means no key file.  PASSWORD, if present, is
-either the master password itself (a string) or a no-argument function
-returning it; nil means prompt the user as usual (via `password-cache').
+returning the file name; nil means no key file.
+
+PASSWORD distinguishes three cases:
+  absent (list has no third element)   -> prompt the user (the default)
+  nil (the third element is literally nil) -> the database has NO password
+  a string or no-argument function     -> that password
 
 Returns (PATH KEYFILE PASSWORD) where KEYFILE is a file-name string or
-nil and PASSWORD is a string, a function, or nil (meaning prompt)."
-  (let ((path spec) keyfile password)
+nil, and PASSWORD is a string, a function, the symbol `:prompt' (meaning
+ask the user), or nil (meaning no password)."
+  (let ((path spec) keyfile password has-password)
     (when (consp spec)
       (setq path (nth 0 spec)
             keyfile (nth 1 spec)
+            has-password (> (length spec) 2)
             password (nth 2 spec)))
-    (list path keyfile password)))
+    (list path keyfile
+          (cond ((not (consp spec)) :prompt)      ; plain string -> prompt
+                ((not has-password) :prompt)
+                (t password)))))
+
+(defun keepass-auth-source--no-password (db)
+  "Return whether DB has no master password, honouring a cached answer.
+A database created with `--no-password' has no master password; the
+password cache keyed by DB records a yes-or-no answer."
+  (let ((password-cache-expiry (or keepass-auth-source-cache-expiry nil)))
+    (and (password-in-cache-p db)            ; cached at all
+         (not (car (password-read-from-cache db))))))
+
+(defun keepass-auth-source--resolve-password (password-spec db &optional expiry)
+  "Return the master password for DB from PASSWORD-SPEC.
+Returns a string (the password), or the symbol `:no-password' meaning the
+database has no master password and `--no-password' must be passed to
+keepassxc-cli.  The cases:
+  `keepass-auth-source--normalize-db''s `:prompt'  -> ask the user (and
+      cache) as usual, returning the typed string;
+  a string     -> used as-is;
+  a function   -> called to obtain its result;
+  nil          -> the database has no master password; return `:no-password'."
+  (pcase password-spec
+    ((pred stringp) password-spec)
+    ((pred functionp) (let ((v (funcall password-spec)))
+                        (if v v :no-password)))
+    (:prompt (keepass-auth-source--read-password db expiry))
+    (_ :no-password)))
 
 (defun keepass-auth-source--resolve-keyfile (keyfile)
   "Resolve a key file specification KEYFILE to a file name, or nil.
@@ -241,16 +273,6 @@ else (including nil) means no key file."
     ((pred stringp) keyfile)
     ((pred functionp) (funcall keyfile))
     (_ nil)))
-
-(defun keepass-auth-source--resolve-password (password-spec db &optional expiry)
-  "Return the master password for DB from its PASSWORD-SPEC.
-A string is returned as-is, a function is called to obtain it, and nil or
-absent means prompt the user (and cache under DB) as usual, honouring
-EXPIRY as in `keepass-auth-source--read-password'."
-  (pcase password-spec
-    ((pred stringp) password-spec)
-    ((pred functionp) (funcall password-spec))
-    (_ (keepass-auth-source--read-password db expiry))))
 
 (defun keepass-auth-source--read-password (db &optional expiry)
   "Read the master password for database DB, caching it for reuse.
@@ -275,15 +297,21 @@ expanded so a leading \"~\" works."
 
 (defun keepass-auth-source--log (format-string &rest args)
   "Append a line to the *keepass-auth-source-log* buffer (read-only).
-The buffer is never displayed automatically; the user can open it with
-\\[switch-to-buffer] when curious."
+The buffer is never displayed automatically and nothing is echoed to
+*Messages*; the user can open it with \\[switch-to-buffer] when curious."
   (let ((line (apply #'format format-string args)))
     (with-current-buffer (get-buffer-create "*keepass-auth-source-log*")
       (setq buffer-read-only t)
       (let ((inhibit-read-only t))
         (goto-char (point-max))
-        (insert line "\n")))
-    (message "%s" line)))
+        (insert line "\n")))))
+
+(defun keepass-auth-source--no-password-flag (password)
+  "Return the keepassxc-cli global option for a password-less database, or nil.
+PASSWORD is the resolved master password; the symbol `:no-password' means
+the database has no master password and keepassxc-cli must be told so with
+its `--no-password' option instead of reading stdin."
+  (if (eq password :no-password) (list "--no-password") nil))
 
 (defun keepass-auth-source--keepassxc-run (password &rest args)
   (when keepass-auth-source-verbose
@@ -294,8 +322,10 @@ The buffer is never displayed automatically; the user can open it with
     (unwind-protect
         (with-temp-buffer
           ;; Feed PASSWORD (plus a terminating newline, as interactive
-          ;; keepassxc-cli reads input line-by-line) to the child's stdin.
-          (insert (or password "") "\n")
+          ;; keepassxc-cli reads input line-by-line) to the child's stdin,
+          ;; unless the database has no password at all.
+          (unless (eq password :no-password)
+            (insert (or password "") "\n"))
           (let ((exit (apply #'call-process-region
                              (point-min) (point-max)
                              prog t (list out-buf) nil
@@ -446,6 +476,7 @@ non-nil, is the database's key file (see
   (let* ((run (apply #'keepass-auth-source--keepassxc-run
                      password
                      (append (list "search" "--quiet")
+                             (keepass-auth-source--no-password-flag password)
                              (keepass-auth-source--keyfile-args keyfile)
                              (list entity term))))
          (output (car run))
@@ -477,6 +508,7 @@ the full SPEC.  Returns (ENTRIES . STATUS)."
          (open (apply #'keepass-auth-source--keepassxc-run
                       password
                       (append (list "ls" "--quiet")
+                              (keepass-auth-source--no-password-flag password)
                               (keepass-auth-source--keyfile-args keyfile)
                               (list db))))
          (locked-p (not (eq (cdr open) 0)))
@@ -492,6 +524,7 @@ the full SPEC.  Returns (ENTRIES . STATUS)."
                                             password
                                             (append
                                              (list "show" "--quiet" "--show-protected")
+                                             (keepass-auth-source--no-password-flag password)
                                              (keepass-auth-source--keyfile-args keyfile)
                                              (list db path)))))
                               paths))
@@ -531,8 +564,13 @@ nil for backends that do not emit one."
   (let* ((db-info (keepass-auth-source--normalize-db
                    (slot-value backend 'source)))
          (entity (nth 0 db-info))
-         (keyfile (plist-get (slot-value backend 'data) :keyfile))
-         (password-spec (plist-get (slot-value backend 'data) :password-spec)))
+         (keyfile (or (plist-get (slot-value backend 'data) :keyfile)
+                      (nth 1 db-info)))
+         (password-spec (or (plist-get (slot-value backend 'data) :password-spec)
+                            ;; backend built with a plain string :source has
+                            ;; no :data; default to :prompt (ask user), never
+                            ;; to nil (which would mean "no password").
+                            (nth 2 db-info))))
     (when (file-exists-p entity)
       (when keepass-auth-source-verbose
         (message "keepass-auth-source-search spec: host=%S user=%S port=%S title=%S"
