@@ -70,22 +70,19 @@ Add =keepass-auth-source= to your =load-path=.
 #+BEGIN_SRC elisp
   (require 'keepass-auth-source)
   (keepass-auth-source-enable)
-  (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
+  (add-to-list 'auth-sources (keepass-make-db-spec :file "~/.emacs.d/passwords.kdbx"))
 #+END_SRC
 
-Each =auth-sources= entry is a *database spec*: either the database file
-name, or a keyword spec built with =keepass-make-db-spec= when you need a
-key file, a fixed password, a YubiKey or a passwordless database.  See
-[[The database spec]] below.
+Each =auth-sources= entry is a *database spec*: a keyword plist built
+with =keepass-make-db-spec=.  The simplest spec is just a file; add
+keywords for a key file, a fixed password, a YubiKey or a passwordless
+database.  See [[The database spec]] below.
 
 *** The database spec
 
 Every database used by this package -- in =auth-sources= or in
-=keepass-browse-databases= -- is one of two things:
-
-1. a database file name (a string): no key file, no YubiKey, and the
-   master password is requested when needed (the default);
-2. a keyword spec built with =keepass-make-db-spec=.
+=keepass-browse-databases= -- is a keyword spec built with
+=keepass-make-db-spec=.
 
 =keepass-make-db-spec= takes keywords and returns a plain plist that the
 package reads through accessors like a struct, so the keywords can be
@@ -207,7 +204,7 @@ A complete, working outgoing-mail setup:
 #+BEGIN_SRC elisp
   (require 'keepass-auth-source)
   (keepass-auth-source-enable)
-  (add-to-list 'auth-sources "~/.emacs.d/passwords.kdbx")
+  (add-to-list 'auth-sources (keepass-make-db-spec :file "~/.emacs.d/passwords.kdbx"))
 
   (setq send-mail-function        'smtpmail-send-it
         message-send-mail-function 'smtpmail-send-it

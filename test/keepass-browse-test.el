@@ -119,8 +119,7 @@
 (ert-deftest keepass-browse-spec-label ()
   "A database spec's label is its :name, defaulting to the file name."
   (should (equal "mydb" (keepass-browse--spec-label '(:name "mydb" :file "/p/db.kdbx"))))
-  (should (equal "db.kdbx" (keepass-browse--spec-label '(:file "/path/db.kdbx"))))
-  (should (equal "db.kdbx" (keepass-browse--spec-label "db.kdbx"))))
+  (should (equal "db.kdbx" (keepass-browse--spec-label '(:file "/path/db.kdbx")))))
 
 (ert-deftest keepass-browse-select-database-by-label ()
   "Selecting a database completes over labels and sets a plist spec."

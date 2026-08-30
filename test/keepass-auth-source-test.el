@@ -149,15 +149,21 @@ Runs inside the keepassxc backend with PASS as the master password."
     (keepass-auth-source--with-cli 'keepassxc
       (let ((password-cache-expiry nil))
         (password-cache-add db "PASS"))
-      (let ((backend (auth-source-backend :type 'keepass :source db
-                                          :search-function #'keepass-auth-source-search)))
+      (let ((backend (auth-source-backend
+                      :type 'keepass
+                      :source db
+                      :data (keepass-make-db-spec :file db)
+                      :search-function #'keepass-auth-source-search)))
         (apply #'keepass-auth-source-search :backend backend :max 5 (append spec nil))))))
 
 (ert-deftest keepass-auth-source-integration-via-keepassxc ()
   (skip-unless keepass-auth-source-test-program)
   (let* ((db (keepass-auth-source-test-make-db))
-         (backend (auth-source-backend :type 'keepass :source db
-                                       :search-function #'keepass-auth-source-search)))
+         (backend (auth-source-backend
+                   :type 'keepass
+                   :source db
+                   :data (keepass-make-db-spec :file db)
+                   :search-function #'keepass-auth-source-search)))
     (unwind-protect
         (progn
           (keepass-auth-source--with-cli 'keepassxc
@@ -302,8 +308,11 @@ A search must return all entries that match *every* key given, and only them."
   "A wrong master password is reported, not silently empty."
   (skip-unless keepass-auth-source-test-program)
   (let* ((db (keepass-auth-source-test-make-db))
-         (backend (auth-source-backend :type 'keepass :source db
-                                       :search-function #'keepass-auth-source-search)))
+         (backend (auth-source-backend
+                   :type 'keepass
+                   :source db
+                   :data (keepass-make-db-spec :file db)
+                   :search-function #'keepass-auth-source-search)))
     (unwind-protect
         (keepass-auth-source--with-cli 'keepassxc
           (let ((password-cache-expiry nil))
@@ -445,10 +454,9 @@ database with no master password, while omission means `:prompt'."
     (should (equal "1:7" (keepass-db-spec-yubi spec)))))
 
 (ert-deftest keepass-db-spec-normalize ()
-  "A string or spec plist normalizes to the canonical plist."
-  ;; Plain string: canonical plist, password = :prompt.
-  (should (equal '(:name nil :file "db.kdbx" :keyfile nil :password :prompt :yubi nil)
-                 (keepass-db-spec-normalize "db.kdbx")))
+  "A spec plist normalizes to the canonical plist; a bare string is rejected."
+  ;; A bare file name is no longer a valid spec -- use `keepass-make-db-spec'.
+  (should-error (keepass-db-spec-normalize "db.kdbx"))
   ;; A spec plist carries its fields through, re-canonicalized.
   (should (equal '(:name nil :file "d.kdbx" :keyfile nil :password nil :yubi "1:7")
                  (keepass-db-spec-normalize (keepass-make-db-spec
@@ -534,7 +542,8 @@ by searches that request a port."
         (dir (make-temp-file "kpa-multi-" t))
         (db1 (concat (file-name-as-directory (make-temp-file "one-" t)) "one.kdbx"))
         (db2 (concat (file-name-as-directory (make-temp-file "two-" t)) "two.kdbx"))
-        (auth-sources (list db1 db2)))
+        (auth-sources (list (keepass-make-db-spec :file db1)
+                                       (keepass-make-db-spec :file db2))))
     ;; Register the backend parser, as `keepass-auth-source-enable' would:
     ;; without it auth-source parses the .kdbx entries with its default
     ;; (netrc) parser and the search finds no usable backend.
