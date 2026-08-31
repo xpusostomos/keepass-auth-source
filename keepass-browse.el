@@ -5,7 +5,7 @@
 ;; Author: Chris Bitmead <xpusostomos@gmail.com>
 ;; Maintainer: Chris Bitmead <xpusostomos@gmail.com>
 ;; Assisted-by: Claude
-;; Version: 0.1.0
+; Version: 0.1.0
 ;; Package-Requires: ((emacs "27.1") (consult "0.1") (embark "0.1") (embark-consult "0.1"))
 ;; Keywords: comm, tools, passwords, keepassxc
 ;; URL: https://github.com/xpusostomos/keepass-auth-source
@@ -617,7 +617,7 @@ CustomIconUUID spelling."
                       (keepass-browse--xml-tag-text icon 'Data)))))
             (keepass-browse--xml-children-tag icons 'Icon))))
 
-(defcustom keepass-browse-icon-scale 1.1
+(defcustom keepass-browse-icon-scale 1.5
   "Size multiplier for custom icon images, relative to the line height.
 1.0 is exactly the height of a line of text; emoji glyphs tend to render
 a touch larger than that (and icon PNGs often carry transparent padding),
@@ -634,18 +634,20 @@ the default frame character height; the view buffer uses a multiple."
     (max 8 (round (* keepass-browse-icon-scale (or scale 1.0) h)))))
 
 (defun keepass-browse--custom-icon-image (uuid &optional max)
-  "Return an image for custom icon UUID scaled to MAX pixels, or nil.
+  "Return an image for custom icon UUID scaled to MAX pixels tall, or nil.
 MAX defaults to one glyph height (see `keepass-browse--icon-pixels').
-Images are created once and cached.  Returns nil when UUID is unknown or
-the bytes are not a renderable image."
+The image is scaled to exactly MAX via `:height' -- unlike `:max-width'
+and `:max-height', which only shrink oversized images and would leave a
+small icon (e.g. a 16x16 favicon) at its natural size no matter what
+scale was asked for.  Images are created once and cached.  Returns nil
+when UUID is unknown or the bytes are not a renderable image."
   (let ((max (or max (keepass-browse--icon-pixels))))
     (when-let* ((bytes (cdr (assoc uuid keepass-browse--custom-icons)))
                 (key (cons uuid max)))
       (or (cdr (assoc key keepass-browse--icon-image-cache))
           (let ((img (condition-case nil
                          (create-image bytes 'png t
-                                       :max-width max
-                                       :max-height max
+                                       :height max
                                        :ascent 'center)
                        (error nil))))
             (when img
