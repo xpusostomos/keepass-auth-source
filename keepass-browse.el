@@ -617,7 +617,7 @@ CustomIconUUID spelling."
                       (keepass-browse--xml-tag-text icon 'Data)))))
             (keepass-browse--xml-children-tag icons 'Icon))))
 
-(defcustom keepass-browse-icon-scale 1.5
+(defcustom keepass-browse-icon-scale 0.8
   "Size multiplier for custom icon images, relative to the line height.
 1.0 is exactly the height of a line of text; emoji glyphs tend to render
 a touch larger than that (and icon PNGs often carry transparent padding),
