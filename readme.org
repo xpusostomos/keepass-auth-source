@@ -500,6 +500,9 @@ in the meantime.
 
 - =keepass-browse-fields= -- which canonical fields are shown in each
   candidate line and in what order (default =("Title" "UserName" "URL")=).
+- =keepass-browse-field-width= -- width each field is clipped to in the
+  candidate lines (default 24).  Raise it if long titles -- e.g. ones
+  containing =/= -- are hard to tell apart.
 - =keepass-browse-default-action= -- what RET does after
   =keepass-browse= selects an entry (default =keepass-browse-view=).
 - =keepass-browse-cache-expiry= -- master-password expiry for browsing

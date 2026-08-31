@@ -110,6 +110,13 @@ Each must be a standard KeePass field name: \"Title\", \"UserName\",
                          (const "Password") (const "URL") (const "Notes")))
   :group 'keepass-browse)
 
+(defcustom keepass-browse-field-width 24
+  "Width each field is truncated or padded to in candidate lines.
+Raise this to see more of long values -- titles containing \"/\"
+(particularly) are easier to tell apart when not clipped hard."
+  :type 'integer
+  :group 'keepass-browse)
+
 (defcustom keepass-browse-clear-clipboard-seconds 0
   "If non-zero, clear the clipboard this many seconds after a copy."
   :type 'integer
@@ -201,6 +208,13 @@ generation; thereafter the default offered.")
 
 (defvar keepass-browse--entry-custom-icons nil
   "((PATH . UUID)) custom icon per entry path from the last export.")
+
+(defvar keepass-browse--entry-parents nil
+  "((ENTRY-PATH . GROUP-PATH)) real parent group per entry.
+Recorded from the export tree while collecting.  Titles may contain
+\"/\" (e.g. \"Pika Backup \\=\\='mnt/myhub\\='\"), so an entry's path
+string alone cannot be split into group and title -- this map is the
+only reliable record of where an entry lives.")
 
 (defvar keepass-browse--group-icons nil
   "((PATH . (ICON-ID . CUSTOM-UUID))) per group from the last export.
@@ -435,6 +449,12 @@ groups' names are."
         (when (and custom-id (not (string-empty-p custom-id)))
           (push (cons path (string-trim custom-id))
                 keepass-browse--entry-custom-icons))
+        ;; Remember where the entry really lives: a title containing "/"
+        ;; makes the path string ambiguous, so the group path cannot be
+        ;; recovered from it later.  Stored with a trailing slash (the root
+        ;; is "/") so it compares equal to normalized group paths.
+        (push (cons path (concat group-path "/"))
+              keepass-browse--entry-parents)
         (setq acc (cons (cons path fields) acc))))
     ;; Recurse into child groups, extending the path with the group name.
     (dolist (subgroup (keepass-browse--xml-children-tag node 'Group))
@@ -476,6 +496,7 @@ Also captures the database's custom icon images, which entries use them
     (setq keepass-browse--custom-icons
           (keepass-browse--custom-icons-from tree)
           keepass-browse--entry-custom-icons nil
+          keepass-browse--entry-parents nil
           keepass-browse--group-icons nil)
     (dolist (g (keepass-browse--xml-children-tag root 'Group))
       ;; Start below the root group: its own name names no path, exactly
@@ -529,17 +550,25 @@ from the entry paths and from the group tree recorded in
          (in-group nil)
          (subgroups nil))
     (dolist (entry entries)
-      (let ((path (car entry)))
-        (when (string-equal (keepass-browse--entry-directory path) group)
-          (push entry in-group))
-        ;; A path strictly deeper than GROUP contributes its next segment as a
-        ;; subgroup; a direct child entry (rest has no "/") is just that.
-        (when (and (string-prefix-p group path)
-                   (string-match-p "/" (substring path (length group))))
-          (let* ((rest (substring path (length group)))
-                 (seg (car (split-string rest "/" t))))
-            (when (and seg (not (string-empty-p seg)))
-              (push (concat group seg "/") subgroups))))))
+      (let* ((path (car entry))
+             (parent (cdr (assoc path keepass-browse--entry-parents))))
+        (if parent
+            ;; The real parent group is known from the export tree, so the
+            ;; entry belongs exactly there -- whatever its title contains
+            ;; (a title with "/" must not become phantom subgroups).
+            (when (string-equal parent group)
+              (push entry in-group))
+          ;; No recorded parent (synthetic data): fall back to the path.
+          (when (string-equal (keepass-browse--entry-directory path) group)
+            (push entry in-group))
+          ;; A path strictly deeper than GROUP contributes its next segment as a
+          ;; subgroup; a direct child entry (rest has no "/") is just that.
+          (when (and (string-prefix-p group path)
+                     (string-match-p "/" (substring path (length group))))
+            (let* ((rest (substring path (length group)))
+                   (seg (car (split-string rest "/" t))))
+              (when (and seg (not (string-empty-p seg)))
+                (push (concat group seg "/") subgroups)))))))
     ;; Groups recorded from the export tree: unlike the entry-derived
     ;; segments above, these include empty groups.  A recorded path is the
     ;; group itself, so even a direct child (rest without "/") contributes.
@@ -724,7 +753,7 @@ has one, else a unicode glyph approximating its standard icon (see
                       (mapconcat
                        (lambda (f)
                          (truncate-string-to-width (keepass-browse--field entry f)
-                                                   24 0 ?\s))
+                                                   keepass-browse-field-width 0 ?\s))
                        keepass-browse-fields "\t"))))
     (put-text-property 0 (length str) 'kb-path path str)
     str))

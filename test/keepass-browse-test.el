@@ -342,6 +342,7 @@ known\").  The pure string helpers must never touch those."
 (ert-deftest keepass-browse-group-contents-tramp-safe ()
   "`group-contents' handles entry titles that look like TRAMP remote names."
   (let ((keepass-browse--group-icons nil) ; hermetic: no tree groups
+        (keepass-browse--entry-parents nil) ; and no recorded parents
         (entries '(("/Apple:foo:bar" . nil)
                    ("/Internet/Apple:foo:bar" . nil)
                    ("/Work/g" . nil))))
@@ -354,6 +355,7 @@ known\").  The pure string helpers must never touch those."
 (ert-deftest keepass-browse-group-contents ()
   "`group-contents' splits entries into child groups and child entries."
   (let ((keepass-browse--group-icons nil) ; hermetic: no tree groups
+        (keepass-browse--entry-parents nil) ; and no recorded parents
         (entries '(("/Internet/Google/a" . nil)
                    ("/Internet/Google/b" . nil)
                    ("/Internet/Yahoo/c" . nil)
@@ -459,6 +461,26 @@ skipped."
     ;; glyph on a non-graphic display.
     (should (equal "🌍" (keepass-browse--group-prefix "/Internet/")))
     (should (equal "📁" (keepass-browse--group-prefix "/Internet/Empty/")))))
+
+(ert-deftest keepass-browse-group-contents-parents ()
+  "Entries are classified by their recorded parent group, so a title
+containing \"/\" cannot carve itself into phantom subgroups."
+  (let* ((slashy "/Backups/Pika Backup “x – /mnt/y”")
+         (keepass-browse--entry-parents `((,slashy . "/Backups/")))
+         (keepass-browse--group-icons '(("/Backups" . ("48" . nil))))
+         (entries `((,slashy . nil) ("/Backups/Normal" . nil))))
+    ;; Root: /Backups is a real subgroup; the slashy title does not leak a
+    ;; phantom "Pika Backup “x –" segment.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/")))
+      (should (equal '("/Backups/") groups))
+      (should (null subs)))
+    ;; /Backups: the slashy entry is a direct child, with its full title.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/Backups/")))
+      (should (null groups))
+      (should (equal (sort (mapcar #'car entries) #'string<)
+                     (mapcar #'car subs))))))
 
 (ert-deftest keepass-browse-group-contents-includes-empty ()
   "`group-contents' lists empty groups recorded from the export tree."
