@@ -245,6 +245,23 @@ The `:length' placeholder is replaced by the requested length as a string
          (cand (keepass-browse--format-candidate path entry)))
     (should (equal path (keepass-browse--path-of cand)))))
 
+(ert-deftest keepass-browse-format-candidate-icon-prefix ()
+  "`format-candidate' prefixes the glyph for the entry's IconID."
+  (let* ((keepass-browse-fields '("Title"))
+         (cand (keepass-browse--format-candidate
+                "/mail" '(("IconID" . "19") ("Title" . "mail")))))
+    ;; 19 is the envelope.
+    (should (string-prefix-p "✉️" cand))
+    (should (string-match-p "mail" cand))
+    ;; The kb-path tag still covers the glyph, so Embark/vertico resolve it.
+    (should (equal "/mail" (keepass-browse--path-of cand))))
+  ;; Out-of-range and missing ids get no glyph.
+  (should (string-prefix-p "T"
+                           (keepass-browse--format-candidate
+                            "/x" '(("IconID" . "999") ("Title" . "T")))))
+  (should (string-prefix-p "T"
+                           (keepass-browse--format-candidate "/x" '(("Title" . "T"))))))
+
 (ert-deftest keepass-browse-valid-field-p ()
   "Only the five standard fields are recognised."
   (should (keepass-browse--valid-field-p "Title"))

@@ -406,6 +406,11 @@ groups' names are."
     ;; Add each entry in this node.
     (dolist (entry (keepass-browse--xml-children-tag node 'Entry))
       (let* ((fields (keepass-browse--entry-fields entry))
+             ;; The entry's standard icon id, for the picker glyph.
+             (icon-id (keepass-browse--xml-tag-text entry 'IconID))
+             (fields (if (and icon-id (not (string-empty-p icon-id)))
+                         (cons (cons "IconID" icon-id) fields)
+                       fields))
              (title (cdr (assoc "Title" fields)))
              (path (concat group-path "/" title)))
         (setq acc (cons (cons path fields) acc))))
@@ -482,13 +487,107 @@ entry (PATH . FIELDS) pairs, both sorted by path."
 
 ;;; Candidates
 
+;; KeePassXC's standard entry icons (ID 0..68), each mapped to a unicode
+;; character approximating the artwork, so candidates can be prefixed with a
+;; glyph instead of shipping or rendering the SVG set.  Where the artwork has
+;; no direct unicode equivalent the closest imaginative stand-in is used.
+(defconst keepass-browse--icon-chars
+  ["🔑"  ;  0 password (key)
+   "🌍"  ;  1 network (world)
+   "⚠️"  ;  2 warning
+   "🗄️"  ;  3 server (stacked)
+   "📋"  ;  4 clipboard
+   "👤"  ;  5 user
+   "⚙"  ;  6 parts (puzzle)
+   "📝"  ;  7 notepad
+   "📤"  ;  8 upload arrow
+   "🪪"  ;  9 identity
+   "📧"  ; 10 contact (@-mail)
+   "📷"  ; 11 camera
+   "🕹️️"  ; 12 IR Remote
+   "🗝️"  ; 13 multi keys
+   "🔌️"  ; 14 plug 
+   "📻"  ; 15 scanner
+   "🔖"  ; 16 bookmark
+   "💿"  ; 17 CDROM
+   "🖥️"  ; 18 display
+   "✉️"  ; 19 mail
+   "⚙️"  ; 20 configuration (gear)
+   "🗹"  ; 21 organiser (tick/clipboard)
+   "📄"  ; 22 paper
+   "🔣"  ; 23 icons
+   "⚡"  ; 24 connection (lightning)
+   "🪎"  ; 25 safe/vault
+   "💾"  ; 26 save (floppy)
+   "⏏"  ; 27 nfs unmount
+   "📽️️"  ; 28 quicktime (film)
+   "🔏"  ; 29 PGP (locked terminal)
+   "$_"  ; 30 terminal
+   "🖨️"  ; 31 printer
+   "🎛️"  ; 32 FS view (buttons)
+   "🧱"  ; 33 run (bricks/grid)
+   "🔧"  ; 34 configure (wrench)
+   "🖵"  ; 35 screen share 
+   "🗜️"  ; 36 archive and compression
+   "％"  ; 37 percent/symbols
+   "🪟"  ; 38 samba unmount (windows desktop)
+   "🕐"  ; 39 history (clock)
+   "🔍"  ; 40 find (magnifier)
+   "⛰️"  ; 41 vector graphics (mountain)
+   "📟"  ; 42 memory (chip)
+   "🗑️"  ; 43 trash
+   "📝️"  ; 44 notes
+   "❌"  ; 45 cancel
+   "❓"  ; 46 question
+   "📦"  ; 47 package
+   "📁"  ; 48 folder
+   "📂"  ; 49 folder open
+   "🗃️"  ; 50 tar
+   "🔓️"  ; 51 decrypted
+   "🔒"  ; 52 encrypted
+   "✅"  ; 53 apply (tick)
+   "✏️"  ; 54 pencil
+   "🖼️"  ; 55 thumbnail
+   "👥"  ; 56 address book
+   "📊"  ; 57 spreadsheet
+   "🛡️"  ; 58 PGP (locked terminal)
+   "🛠️"  ; 59 tools
+   "🏠"  ; 60 home
+   "⭐"  ; 61 star
+   "🐧"  ; 62 Linux
+   "🤖"  ; 63 Android
+   "🍎"  ; 64 Apple
+   "🔗"  ; 65 wiki
+   "💵"  ; 66 money
+   "📜"  ; 67 certificate
+   "📱"  ; 68 mobile
+   ]
+  "Unicode glyph for each standard KeePass icon ID (0..68).
+Indexed by IconID; see `keepass-browse--icon-char'.")
+
+(defun keepass-browse--icon-char (entry)
+  "Return the unicode glyph for ENTRY's standard icon, or \"\".
+ENTRY is a (FIELD . VALUE) alist carrying an \"IconID\" when it came from
+a database export; entries without one (e.g. from `show') get no glyph."
+  (let* ((id (cdr (assoc "IconID" entry)))
+         (n (and id (string-to-number id)))
+         (chars keepass-browse--icon-chars))
+    (if (and n (>= n 0) (< n (length chars)))
+        (aref chars n)
+      "")))
+
 (defun keepass-browse--format-candidate (path entry)
-  "Return a display string for ENTRY at PATH, tagged with `kb-path'."
-  (let ((str (mapconcat
-              (lambda (f)
-                (truncate-string-to-width (keepass-browse--field entry f)
-                                          24 0 ?\s))
-              keepass-browse-fields "\t")))
+  "Return a display string for ENTRY at PATH, tagged with `kb-path'.
+The line is prefixed with a unicode glyph approximating the entry's
+KeePass icon (see `keepass-browse--icon-chars')."
+  (let* ((icon (keepass-browse--icon-char entry))
+         (str (concat icon
+                      (when (not (string-empty-p icon)) " ")
+                      (mapconcat
+                       (lambda (f)
+                         (truncate-string-to-width (keepass-browse--field entry f)
+                                                   24 0 ?\s))
+                       keepass-browse-fields "\t"))))
     (put-text-property 0 (length str) 'kb-path path str)
     str))
 
