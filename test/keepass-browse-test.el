@@ -262,6 +262,60 @@ The `:length' placeholder is replaced by the requested length as a string
   (should (string-prefix-p "T"
                            (keepass-browse--format-candidate "/x" '(("Title" . "T"))))))
 
+(ert-deftest keepass-browse-custom-icons-parse-and-prefix ()
+  "Custom icon blobs and entry references come out of the export XML."
+  (skip-unless (fboundp 'libxml-parse-xml-region))
+  (let* ((xml "<KeePassFile><Meta><CustomIcons><Icon>\
+<UUID>abc+/==</UUID><Data>iVBORw0KGgo=</Data></Icon></CustomIcons></Meta>\
+<Root><Group><Entry><UUID>u1</UUID><IconID>0</IconID>\
+<CustomIconUUID>abc+/==</CustomIconUUID>\
+<String><Key>Title</Key><Value>mail</Value></String></Entry>\
+<Entry><UUID>u2</UUID><IconID>19</IconID>\
+<String><Key>Title</Key><Value>plain</Value></String></Entry>\
+</Group></Root></KeePassFile>")
+         (tree (with-temp-buffer
+                 (insert xml)
+                 (libxml-parse-xml-region (point-min) (point-max))))
+         (keepass-browse--custom-icons nil)
+         (keepass-browse--entry-custom-icons nil)
+         (entries (progn
+                    (setq keepass-browse--custom-icons
+                          (keepass-browse--custom-icons-from tree))
+                    (keepass-browse--collect
+                     (car (keepass-browse--xml-children-tag
+                           (car (keepass-browse--xml-children-tag tree 'Root))
+                           'Group))
+                     ""))))
+    ;; The blob is decoded (base64 of a PNG header).
+    (should (equal "abc+/==" (caar keepass-browse--custom-icons)))
+    (should (equal "\211PNG" (substring (cdar keepass-browse--custom-icons) 0 4)))
+    ;; The entry referencing the icon is mapped by path.
+    (should (equal '(("/mail" . "abc+/=="))
+                   keepass-browse--entry-custom-icons))
+    ;; Candidates still tag paths, and the plain entry keeps its glyph.
+    (let ((keepass-browse-fields '("Title")))
+      (should (equal "/mail"
+                     (keepass-browse--path-of
+                      (keepass-browse--format-candidate
+                       "/mail" (cdr (assoc "/mail" entries))))))
+      (should (string-prefix-p "✉️"
+                               (keepass-browse--format-candidate
+                                "/plain" (cdr (assoc "/plain" entries)))))))
+  ;; The custom icon becomes a real image on a graphic display, shown as a
+  ;; propertized space prefix; unknown UUIDs fall back to the glyph.
+  (let ((keepass-browse--custom-icons '(("abc+/==" . "\211PNGxxxx")))
+        (keepass-browse--entry-custom-icons '(("/mail" . "abc+/==")))
+        (keepass-browse-fields '("Title")))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda () t)))
+      (let ((cand (keepass-browse--format-candidate
+                   "/mail" '(("IconID" . "0") ("Title" . "mail")))))
+        (should (equal ?\s (aref cand 0)))
+        (should (eq 'image (car-safe (get-text-property 0 'display cand))))))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda () nil)))
+      (should (string-prefix-p "🔑"
+                               (keepass-browse--format-candidate
+                                "/mail" '(("IconID" . "0") ("Title" . "mail"))))))))
+
 (ert-deftest keepass-browse-valid-field-p ()
   "Only the five standard fields are recognised."
   (should (keepass-browse--valid-field-p "Title"))

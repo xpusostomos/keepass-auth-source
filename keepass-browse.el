@@ -55,6 +55,7 @@
 (require 'consult)
 (require 'embark)
 (require 'embark-consult)
+(require 'image)
 (require 'keepass-auth-source)
 (require 'password-cache)
 (require 'subr-x)
@@ -194,6 +195,15 @@ Nil until the first generation; thereafter the default offered.")
   "Label of the character set last used by `keepass-browse--entry-regenerate'.
 A label from `keepass-browse-generate-options'.  Nil until the first
 generation; thereafter the default offered.")
+
+(defvar keepass-browse--custom-icons nil
+  "((UUID . BYTES)) decoded custom icon images from the last export.")
+
+(defvar keepass-browse--entry-custom-icons nil
+  "((PATH . UUID)) custom icon per entry path from the last export.")
+
+(defvar keepass-browse--icon-image-cache nil
+  "Created custom icon images, keyed by (UUID . MAX-PIXELS).")
 
 ;; vertico is an optional completion framework (consult works without it);
 ;; these variables only exist once vertico is loaded, hence the `defvar'
@@ -411,8 +421,13 @@ groups' names are."
              (fields (if (and icon-id (not (string-empty-p icon-id)))
                          (cons (cons "IconID" icon-id) fields)
                        fields))
+             ;; The entry's custom icon, when it has one.
+             (custom-id (keepass-browse--xml-tag-text entry 'CustomIconUUID))
              (title (cdr (assoc "Title" fields)))
              (path (concat group-path "/" title)))
+        (when (and custom-id (not (string-empty-p custom-id)))
+          (push (cons path (string-trim custom-id))
+                keepass-browse--entry-custom-icons))
         (setq acc (cons (cons path fields) acc))))
     ;; Recurse into child groups, extending the path with the group name.
     (dolist (subgroup (keepass-browse--xml-children-tag node 'Group))
@@ -425,10 +440,15 @@ groups' names are."
 (defun keepass-browse--load-entries ()
   "Return ((PATH . FIELDS) ...) for the whole database, freshly.
 Does ONE export call and discards the result, so no entries are cached
-behind the scenes; database changes made elsewhere are always visible."
+behind the scenes; database changes made elsewhere are always visible.
+Also captures the database's custom icon images and which entries use
+them (see `keepass-browse--custom-icons')."
   (let* ((tree (keepass-browse--export))
          (root (car (keepass-browse--xml-children-tag tree 'Root)))
          (entries '()))
+    (setq keepass-browse--custom-icons
+          (keepass-browse--custom-icons-from tree)
+          keepass-browse--entry-custom-icons nil)
     (dolist (g (keepass-browse--xml-children-tag root 'Group))
       (setq entries (append entries (keepass-browse--collect g ""))))
     ;; `keepassxc-cli rm' moves deleted entries to the Recycle Bin; exclude
@@ -576,13 +596,62 @@ a database export; entries without one (e.g. from `show') get no glyph."
         (aref chars n)
       "")))
 
+;;;; Custom icons
+;;
+;; Entries may use an imported image instead of a standard icon.  The kdbx
+;; stores those images once in the database's Meta as base64 blobs keyed by
+;; UUID, and each entry points at one with a CustomIconUUID.  `export'
+;; hands us both, so the images can be decoded and shown as real pictures.
+
+(defun keepass-browse--custom-icons-from (tree)
+  "Return ((UUID . BYTES)) for the custom icons in export XML TREE.
+Each base64 Data blob is decoded; UUID is the entry-level
+CustomIconUUID spelling."
+  (let* ((meta (car (keepass-browse--xml-children-tag tree 'Meta)))
+         (icons (car (keepass-browse--xml-children-tag meta 'CustomIcons))))
+    (mapcar (lambda (icon)
+              (cons (string-trim (keepass-browse--xml-tag-text icon 'UUID))
+                    (base64-decode-string
+                     (replace-regexp-in-string
+                      "[\n\r\t ]" ""
+                      (keepass-browse--xml-tag-text icon 'Data)))))
+            (keepass-browse--xml-children-tag icons 'Icon))))
+
+(defun keepass-browse--custom-icon-image (uuid &optional max)
+  "Return an image for custom icon UUID scaled to MAX pixels, or nil.
+Images are created once and cached.  Returns nil when UUID is unknown or
+the bytes are not a renderable image."
+  (when-let* ((bytes (cdr (assoc uuid keepass-browse--custom-icons)))
+              (key (cons uuid max)))
+    (or (cdr (assoc key keepass-browse--icon-image-cache))
+        (let ((img (condition-case nil
+                       (create-image bytes 'png t
+                                     :max-width (or max 16)
+                                     :max-height (or max 16)
+                                     :ascent 'center)
+                     (error nil))))
+          (when img
+            (push (cons key img) keepass-browse--icon-image-cache))
+          img))))
+
+(defun keepass-browse--candidate-prefix (path entry)
+  "Return the display prefix for the entry at PATH with fields ENTRY.
+A real thumbnail of the entry's custom icon on graphic displays,
+otherwise the unicode glyph for its standard icon."
+  (if-let* ((uuid (cdr (assoc path keepass-browse--entry-custom-icons)))
+            (img (and (display-graphic-p)
+                      (keepass-browse--custom-icon-image uuid 16))))
+      (propertize " " 'display img)
+    (keepass-browse--icon-char entry)))
+
 (defun keepass-browse--format-candidate (path entry)
   "Return a display string for ENTRY at PATH, tagged with `kb-path'.
-The line is prefixed with a unicode glyph approximating the entry's
-KeePass icon (see `keepass-browse--icon-chars')."
-  (let* ((icon (keepass-browse--icon-char entry))
-         (str (concat icon
-                      (when (not (string-empty-p icon)) " ")
+The line is prefixed with a picture of the entry's custom icon when it
+has one, else a unicode glyph approximating its standard icon (see
+`keepass-browse--icon-chars')."
+  (let* ((prefix (keepass-browse--candidate-prefix path entry))
+         (str (concat prefix
+                      (when (not (string-empty-p prefix)) " ")
                       (mapconcat
                        (lambda (f)
                          (truncate-string-to-width (keepass-browse--field entry f)
@@ -770,9 +839,18 @@ which case there is nothing to hide."
          (pw-field (keepass-browse--field entry "Password"))
          (pw (if (or reveal (string-blank-p pw-field))
                  pw-field
-               "[hidden - press r]")))
+               "[hidden - press r]"))
+         (icon (when-let* ((uuid (cdr (assoc keepass-browse-view-path
+                                             keepass-browse--entry-custom-icons)))
+                           (img (and (display-graphic-p)
+                                     (keepass-browse--custom-icon-image uuid 32))))
+                  img)))
     (let ((inhibit-read-only t))
       (erase-buffer)
+      ;; The entry's own picture, when it has a custom icon.
+      (when icon
+        (insert-image icon)
+        (insert "\n\n"))
       ;; Show which database this entry came from when several are configured.
       (when (> (length keepass-browse-databases) 1)
         (insert (format "%-10s %s\n" "Database"
@@ -827,6 +905,10 @@ Does nothing for an entry with no password."
 (defun keepass-browse-view (path)
   "View the entry at PATH, hiding its password until a key reveals it."
   (interactive "sEntry path: ")
+  ;; An entry's custom icon is only known from an export; if this view was
+  ;; not reached through a browse listing, load once so the icon is there.
+  (unless (assoc path keepass-browse--entry-custom-icons)
+    (keepass-browse--load-entries))
   (let ((buf (get-buffer-create "*keepass-browse-view*")))
     (with-current-buffer buf
       (keepass-browse-view-mode)

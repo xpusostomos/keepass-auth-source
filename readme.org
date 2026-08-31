@@ -389,6 +389,12 @@ Three entry points:
 
 From any of these, the entry actions are:
 
+Each entry is prefixed with its icon: on a graphic display an entry with
+a custom icon shows the actual image (a small thumbnail in the picker, a
+larger one at the top of the view buffer); otherwise a unicode glyph
+approximates the entry's standard KeePass icon (key, globe, envelope,
+camera, ...).
+
 | key   | action                                |
 |-------+---------------------------------------|
 | =t=   | copy title                            |
