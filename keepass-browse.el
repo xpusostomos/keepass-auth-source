@@ -617,22 +617,31 @@ CustomIconUUID spelling."
                       (keepass-browse--xml-tag-text icon 'Data)))))
             (keepass-browse--xml-children-tag icons 'Icon))))
 
+(defun keepass-browse--icon-pixels (&optional scale)
+  "Return the pixel size for a custom icon at SCALE.
+The picker matches the height of a unicode glyph, which renders at about
+the default frame character height; the view buffer uses a multiple."
+  (let ((h (condition-case nil (frame-char-height) (error 16))))
+    (max 8 (round (* (or scale 1.0) h)))))
+
 (defun keepass-browse--custom-icon-image (uuid &optional max)
   "Return an image for custom icon UUID scaled to MAX pixels, or nil.
+MAX defaults to one glyph height (see `keepass-browse--icon-pixels').
 Images are created once and cached.  Returns nil when UUID is unknown or
 the bytes are not a renderable image."
-  (when-let* ((bytes (cdr (assoc uuid keepass-browse--custom-icons)))
-              (key (cons uuid max)))
-    (or (cdr (assoc key keepass-browse--icon-image-cache))
-        (let ((img (condition-case nil
-                       (create-image bytes 'png t
-                                     :max-width (or max 16)
-                                     :max-height (or max 16)
-                                     :ascent 'center)
-                     (error nil))))
-          (when img
-            (push (cons key img) keepass-browse--icon-image-cache))
-          img))))
+  (let ((max (or max (keepass-browse--icon-pixels))))
+    (when-let* ((bytes (cdr (assoc uuid keepass-browse--custom-icons)))
+                (key (cons uuid max)))
+      (or (cdr (assoc key keepass-browse--icon-image-cache))
+          (let ((img (condition-case nil
+                         (create-image bytes 'png t
+                                       :max-width max
+                                       :max-height max
+                                       :ascent 'center)
+                       (error nil))))
+            (when img
+              (push (cons key img) keepass-browse--icon-image-cache))
+            img)))))
 
 (defun keepass-browse--candidate-prefix (path entry)
   "Return the display prefix for the entry at PATH with fields ENTRY.
@@ -640,7 +649,7 @@ A real thumbnail of the entry's custom icon on graphic displays,
 otherwise the unicode glyph for its standard icon."
   (if-let* ((uuid (cdr (assoc path keepass-browse--entry-custom-icons)))
             (img (and (display-graphic-p)
-                      (keepass-browse--custom-icon-image uuid 16))))
+                      (keepass-browse--custom-icon-image uuid))))
       (propertize " " 'display img)
     (keepass-browse--icon-char entry)))
 
@@ -843,7 +852,8 @@ which case there is nothing to hide."
          (icon (when-let* ((uuid (cdr (assoc keepass-browse-view-path
                                              keepass-browse--entry-custom-icons)))
                            (img (and (display-graphic-p)
-                                     (keepass-browse--custom-icon-image uuid 32))))
+                                     (keepass-browse--custom-icon-image
+                                      uuid (keepass-browse--icon-pixels 2)))))
                   img)))
     (let ((inhibit-read-only t))
       (erase-buffer)
