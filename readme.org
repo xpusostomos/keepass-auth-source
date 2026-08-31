@@ -385,7 +385,9 @@ Three entry points:
   KeePass folder hierarchy one level at a time (=/=, then =Internet/=,
   then =Google/=, then the entry you want) instead of narrowing a flat
   list.  Choosing a subgroup descends; choosing an entry runs the same
-  =keepass-browse-default-action= as =keepass-browse=.
+  =keepass-browse-default-action= as =keepass-browse=.  Group lines show
+  the group's icon (thumbnails for imported images, glyphs for the
+  standard set), and empty groups are listed too.
 
 From any of these, the entry actions are:
 

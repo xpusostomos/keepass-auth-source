@@ -202,6 +202,13 @@ generation; thereafter the default offered.")
 (defvar keepass-browse--entry-custom-icons nil
   "((PATH . UUID)) custom icon per entry path from the last export.")
 
+(defvar keepass-browse--group-icons nil
+  "((PATH . (ICON-ID . CUSTOM-UUID))) per group from the last export.
+ICON-ID is the standard icon id as a string (48 is the keepassxc default
+for groups); CUSTOM-UUID is the group's custom icon image, or nil.
+Unlike the entry-derived paths in `keepass-browse--group-contents', this
+includes empty groups.  The Recycle Bin subtree is not recorded.")
+
 (defvar keepass-browse--icon-image-cache nil
   "Created custom icon images, keyed by (UUID . MAX-PIXELS).")
 
@@ -437,20 +444,50 @@ groups' names are."
                          acc))))
     acc))
 
+(defun keepass-browse--collect-groups (node group-path)
+  "Record icon info for the child groups of NODE at GROUP-PATH.
+Each child group is recorded in `keepass-browse--group-icons' as
+PATH -> (ICON-ID . CUSTOM-UUID), then recursed into.  NODE should be a
+group element whose own name is GROUP-PATH's business -- `--load-entries'
+starts below the root group, so the root group's own name names no path,
+like entry paths.  The Recycle Bin subtree is filtered out afterwards."
+  (dolist (subgroup (keepass-browse--xml-children-tag node 'Group))
+    (let* ((name (keepass-browse--xml-tag-text subgroup 'Name))
+           (path (concat group-path "/" name))
+           (icon-id (keepass-browse--xml-tag-text subgroup 'IconID))
+           (custom (keepass-browse--xml-tag-text subgroup 'CustomIconUUID)))
+      (push (cons path
+                  (cons icon-id
+                        (and custom (not (string-empty-p custom))
+                             (string-trim custom))))
+            keepass-browse--group-icons)
+      (keepass-browse--collect-groups subgroup path))))
+
 (defun keepass-browse--load-entries ()
   "Return ((PATH . FIELDS) ...) for the whole database, freshly.
 Does ONE export call and discards the result, so no entries are cached
 behind the scenes; database changes made elsewhere are always visible.
-Also captures the database's custom icon images and which entries use
-them (see `keepass-browse--custom-icons')."
+Also captures the database's custom icon images, which entries use them
+(see `keepass-browse--custom-icons'), and the group tree's icons (see
+`keepass-browse--group-icons')."
   (let* ((tree (keepass-browse--export))
          (root (car (keepass-browse--xml-children-tag tree 'Root)))
          (entries '()))
     (setq keepass-browse--custom-icons
           (keepass-browse--custom-icons-from tree)
-          keepass-browse--entry-custom-icons nil)
+          keepass-browse--entry-custom-icons nil
+          keepass-browse--group-icons nil)
     (dolist (g (keepass-browse--xml-children-tag root 'Group))
-      (setq entries (append entries (keepass-browse--collect g ""))))
+      ;; Start below the root group: its own name names no path, exactly
+      ;; like `keepass-browse--collect' for entries.
+      (setq entries (append entries (keepass-browse--collect g "")))
+      (keepass-browse--collect-groups g ""))
+    ;; The Recycle Bin subtree is excluded from the group map, matching the
+    ;; entry filter below.
+    (setq keepass-browse--group-icons
+          (seq-filter (lambda (g)
+                        (not (string-prefix-p "/Recycle Bin" (car g))))
+                      keepass-browse--group-icons))
     ;; `keepassxc-cli rm' moves deleted entries to the Recycle Bin; exclude
     ;; them so a rename (add-new + delete-old) does not show a duplicate.
     (seq-filter (lambda (e)
@@ -485,7 +522,9 @@ ENTRIES is a list of (PATH . FIELDS) pairs as returned by
 \"/\" (e.g. \"/Internet/\"), or \"/\" for the root group; a missing
 trailing slash is added.  Returns (GROUPS . ENTRIES), where GROUPS is the
 list of child group paths (each ending in \"/\") and ENTRIES the child
-entry (PATH . FIELDS) pairs, both sorted by path."
+entry (PATH . FIELDS) pairs, both sorted by path.  Subgroups come both
+from the entry paths and from the group tree recorded in
+`keepass-browse--group-icons', so empty groups are included."
   (let* ((group (if (string-suffix-p "/" group) group (concat group "/")))
          (in-group nil)
          (subgroups nil))
@@ -498,6 +537,16 @@ entry (PATH . FIELDS) pairs, both sorted by path."
         (when (and (string-prefix-p group path)
                    (string-match-p "/" (substring path (length group))))
           (let* ((rest (substring path (length group)))
+                 (seg (car (split-string rest "/" t))))
+            (when (and seg (not (string-empty-p seg)))
+              (push (concat group seg "/") subgroups))))))
+    ;; Groups recorded from the export tree: unlike the entry-derived
+    ;; segments above, these include empty groups.  A recorded path is the
+    ;; group itself, so even a direct child (rest without "/") contributes.
+    (dolist (g keepass-browse--group-icons)
+      (let ((p (car g)))
+        (when (string-prefix-p group p)
+          (let* ((rest (substring p (length group)))
                  (seg (car (split-string rest "/" t))))
             (when (and seg (not (string-empty-p seg)))
               (push (concat group seg "/") subgroups))))))
@@ -680,10 +729,30 @@ has one, else a unicode glyph approximating its standard icon (see
     (put-text-property 0 (length str) 'kb-path path str)
     str))
 
-(defun keepass-browse--format-group (path)
-  "Return a display string for group PATH, tagged with `kb-path'."
+(defun keepass-browse--group-prefix (path)
+  "Return the display prefix for the group at PATH.
+A real thumbnail of the group's custom icon on graphic displays,
+otherwise the unicode glyph for its standard icon (48, a folder, is the
+keepassxc default for groups)."
   (let* ((trimmed (if (string-suffix-p "/" path) (substring path 0 -1) path))
-         (str (concat (keepass-browse--entry-basename trimmed) "/")))
+         (info (cdr (assoc trimmed keepass-browse--group-icons)))
+         (custom (cdr info)))
+    (if-let* ((img (and custom
+                        (display-graphic-p)
+                        (keepass-browse--custom-icon-image custom))))
+        (propertize " " 'display img)
+      (keepass-browse--icon-char
+       `(("IconID" . ,(or (car info) "48")))))))
+
+(defun keepass-browse--format-group (path)
+  "Return a display string for group PATH, tagged with `kb-path'.
+The line is prefixed with the group's icon: a custom thumbnail when the
+group has one, else the glyph for its standard icon."
+  (let* ((trimmed (if (string-suffix-p "/" path) (substring path 0 -1) path))
+         (prefix (keepass-browse--group-prefix path))
+         (str (concat prefix
+                      " "
+                      (keepass-browse--entry-basename trimmed) "/")))
     (put-text-property 0 (length str) 'kb-path path str)
     str))
 

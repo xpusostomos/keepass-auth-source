@@ -341,7 +341,8 @@ known\").  The pure string helpers must never touch those."
 
 (ert-deftest keepass-browse-group-contents-tramp-safe ()
   "`group-contents' handles entry titles that look like TRAMP remote names."
-  (let ((entries '(("/Apple:foo:bar" . nil)
+  (let ((keepass-browse--group-icons nil) ; hermetic: no tree groups
+        (entries '(("/Apple:foo:bar" . nil)
                    ("/Internet/Apple:foo:bar" . nil)
                    ("/Work/g" . nil))))
     (pcase-let* ((`(,groups . ,subs)
@@ -352,7 +353,8 @@ known\").  The pure string helpers must never touch those."
 
 (ert-deftest keepass-browse-group-contents ()
   "`group-contents' splits entries into child groups and child entries."
-  (let ((entries '(("/Internet/Google/a" . nil)
+  (let ((keepass-browse--group-icons nil) ; hermetic: no tree groups
+        (entries '(("/Internet/Google/a" . nil)
                    ("/Internet/Google/b" . nil)
                    ("/Internet/Yahoo/c" . nil)
                    ("/Work/g" . nil)
@@ -404,14 +406,89 @@ known\").  The pure string helpers must never touch those."
     (should (equal "/A/b" (car box)))))
 
 (ert-deftest keepass-browse-format-group-tags-path ()
-  "`format-group' shows the bare segment plus slash, tagged with the full path."
+  "`format-group' prefixes the icon glyph and tags the full path.
+With no icon info recorded, a group shows the keepassxc default (48, a
+folder)."
   (let ((cand (keepass-browse--format-group "/Internet/")))
-    (should (equal "Internet/" cand))
+    (should (string-prefix-p "📁 Internet/" cand))
     (should (equal "/Internet/" (keepass-browse--path-of cand))))
   ;; A nested group keeps its full path in the tag.
   (should (equal "/Internet/Google/"
                  (keepass-browse--path-of
                   (keepass-browse--format-group "/Internet/Google/")))))
+
+(ert-deftest keepass-browse-group-icons-from-export ()
+  "Group paths and icons are recorded from the export tree.
+The root group's own name names no path; the Recycle Bin subtree is
+skipped."
+  (skip-unless (fboundp 'libxml-parse-xml-region))
+  (let ((xml "<KeePassFile><Root><Group><Name>Passwords</Name>\
+<Group><Name>Internet</Name><IconID>1</IconID>\
+<CustomIconUUID>cu-uuid</CustomIconUUID>\
+<Group><Name>Empty</Name><IconID>48</IconID></Group></Group>\
+<Group><Name>Recycle Bin</Name><Group><Name>x</Name></Group></Group>\
+</Group></Root></KeePassFile>")
+        (keepass-browse--group-icons nil))
+    (with-temp-buffer
+      (insert xml)
+      ;; Like `keepass-browse--load-entries': start below the root group,
+      ;; whose own name names no path.
+      (keepass-browse--collect-groups
+       (car (keepass-browse--xml-children-tag
+             (car (keepass-browse--xml-children-tag
+                   (libxml-parse-xml-region (point-min) (point-max)) 'Root))
+             'Group))
+       "")
+      ;; Mirror the Recycle Bin exclusion `keepass-browse--load-entries`
+      ;; applies after collecting.
+      (setq keepass-browse--group-icons
+            (seq-filter (lambda (g)
+                          (not (string-prefix-p "/Recycle Bin" (car g))))
+                        keepass-browse--group-icons)))
+    ;; The root group's name is not recorded...
+    (should-not (assoc "/Passwords" keepass-browse--group-icons))
+    ;; ...but nested groups are, with both standard and custom icons.
+    (should (equal '("1" . "cu-uuid")
+                   (cdr (assoc "/Internet" keepass-browse--group-icons))))
+    (should (equal '("48" . nil)
+                   (cdr (assoc "/Internet/Empty" keepass-browse--group-icons))))
+    ;; The Recycle Bin subtree is not recorded.
+    (should-not (assoc "/Recycle Bin" keepass-browse--group-icons))
+    (should-not (assoc "/Recycle Bin/x" keepass-browse--group-icons))
+    ;; Glyphs come from the recorded ids; the custom icon falls back to the
+    ;; glyph on a non-graphic display.
+    (should (equal "🌍" (keepass-browse--group-prefix "/Internet/")))
+    (should (equal "📁" (keepass-browse--group-prefix "/Internet/Empty/")))))
+
+(ert-deftest keepass-browse-group-contents-includes-empty ()
+  "`group-contents' lists empty groups recorded from the export tree."
+  (let* ((keepass-browse--group-icons
+          '(("/A" . ("48" . nil)) ("/A/Empty" . ("48" . nil))))
+         (entries '(("/A/x" . nil))))
+    ;; Root: /A is a subgroup; the only entry lives under /A, not at root.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/")))
+      (should (equal '("/A/") groups))
+      (should (null subs)))
+    ;; /A: the empty subgroup appears even though no entry lives there.
+    (pcase-let* ((`(,groups . ,subs)
+                  (keepass-browse--group-contents entries "/A/")))
+      (should (equal '("/A/Empty/") groups))
+      (should (equal '("/A/x") (mapcar #'car subs))))))
+
+(ert-deftest keepass-browse-group-custom-icon-thumbnail ()
+  "A group with a custom icon shows an image prefix on a graphic display."
+  (let ((keepass-browse--custom-icons '(("cu" . "\211PNGxx")))
+        (keepass-browse--group-icons '(("/G" . ("48" . "cu")))))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda () t)))
+      (let ((cand (keepass-browse--format-group "/G/")))
+        (should (equal ?\s (aref cand 0)))
+        (should (eq 'image (car-safe (get-text-property 0 'display cand))))
+        (should (equal "/G/" (keepass-browse--path-of cand)))))
+    ;; Non-graphic: the standard-icon glyph.
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda () nil)))
+      (should (string-prefix-p "📁"
+                               (keepass-browse--format-group "/G/"))))))
 
 ;;;; Integration tests (need keepassxc-cli)
 
