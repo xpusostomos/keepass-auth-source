@@ -617,12 +617,21 @@ CustomIconUUID spelling."
                       (keepass-browse--xml-tag-text icon 'Data)))))
             (keepass-browse--xml-children-tag icons 'Icon))))
 
+(defcustom keepass-browse-icon-scale 1.1
+  "Size multiplier for custom icon images, relative to the line height.
+1.0 is exactly the height of a line of text; emoji glyphs tend to render
+a touch larger than that (and icon PNGs often carry transparent padding),
+so the default is slightly above 1 to visually match the unicode glyphs
+used for standard icons."
+  :type 'number
+  :group 'keepass-browse)
+
 (defun keepass-browse--icon-pixels (&optional scale)
   "Return the pixel size for a custom icon at SCALE.
 The picker matches the height of a unicode glyph, which renders at about
 the default frame character height; the view buffer uses a multiple."
   (let ((h (condition-case nil (frame-char-height) (error 16))))
-    (max 8 (round (* (or scale 1.0) h)))))
+    (max 8 (round (* keepass-browse-icon-scale (or scale 1.0) h)))))
 
 (defun keepass-browse--custom-icon-image (uuid &optional max)
   "Return an image for custom icon UUID scaled to MAX pixels, or nil.
