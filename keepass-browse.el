@@ -999,8 +999,9 @@ which case there is nothing to hide."
 
 (defun keepass-browse-view-reveal ()
   "Toggle showing the password in the view buffer.
-A press reveals (and copies) the password; a second press hides it again.
-Does nothing for an entry with no password."
+A press reveals the password; a second press hides it again.  Revealing
+does not copy -- copying is the `p' action.  Does nothing for an entry
+with no password."
   (interactive)
   (if (string-blank-p (keepass-browse--field
                        (keepass-browse--entry-get keepass-browse-view-path)
@@ -1008,11 +1009,6 @@ Does nothing for an entry with no password."
       (message "No password for this entry")
     (setq-local keepass-browse-view--revealed
                 (not keepass-browse-view--revealed))
-    (when keepass-browse-view--revealed
-      (keepass-browse--kill (keepass-browse--field
-                             (keepass-browse--entry-get keepass-browse-view-path)
-                             "Password")
-                            "Password copied to clipboard"))
     (keepass-browse-view-update keepass-browse-view--revealed)))
 
 (defun keepass-browse-view-copy-username ()

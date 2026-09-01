@@ -433,9 +433,9 @@ you want to insert a password into your current buffer.
   ...
 #+END_SRC
 
-Press =r= to reveal the password (which also copies it to the clipboard);
-=u=, =p=, =l=, =n=, =o= copy the corresponding field; =e= edits; =q=
-quits.  The key menu at the bottom shows all the bindings.
+Press =r= to reveal or re-hide the password; =u=, =p=, =l=, =n=, =o= copy
+the corresponding field; =e= edits; =q= quits.  The key menu at the
+bottom shows all the bindings.
 
 **** Editing
 
