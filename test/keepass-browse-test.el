@@ -92,9 +92,10 @@
 
 (ert-deftest keepass-browse-edit-includes-group-line ()
   "`keepass-browse-edit' templates the Group line above Title."
-  (let ((entry '(("Title" . "t") ("UserName" . "u") ("Password" . "p")
-                 ("URL" . "x") ("Notes" . "n")))
-        (box (list nil)))
+  (let* ((entry '(("Title" . "t") ("UserName" . "u") ("Password" . "p")
+                  ("URL" . "x") ("Notes" . "n")))
+         (keepass-browse--entry-parents '(("/g/t" . "/g/")))
+         (box (list nil)))
     ;; Stub entry-get and entry-open to capture the template.
     (cl-letf (((symbol-function 'keepass-browse--entry-get) (lambda (_) entry))
               ((symbol-function 'keepass-browse--entry-open)
@@ -465,12 +466,12 @@ skipped."
 (ert-deftest keepass-browse-group-contents-parents ()
   "Entries are classified by their recorded parent group, so a title
 containing \"/\" cannot carve itself into phantom subgroups."
-  (let* ((slashy "/Backups/Pika Backup “x – /mnt/y”")
-         (keepass-browse--entry-parents `((,slashy . "/Backups/")))
+  (let* ((slashy "/Backups/Odd / Title – with /slashes")
          (keepass-browse--group-icons '(("/Backups" . ("48" . nil))))
-         (entries `((,slashy . nil) ("/Backups/Normal" . nil))))
+         (entries `((,slashy . (("Group" . "/Backups/")))
+                    ("/Backups/Normal" . (("Group" . "/Backups/"))))))
     ;; Root: /Backups is a real subgroup; the slashy title does not leak a
-    ;; phantom "Pika Backup “x –" segment.
+    ;; phantom "Odd / Title –" segment.
     (pcase-let* ((`(,groups . ,subs)
                   (keepass-browse--group-contents entries "/")))
       (should (equal '("/Backups/") groups))
@@ -481,6 +482,24 @@ containing \"/\" cannot carve itself into phantom subgroups."
       (should (null groups))
       (should (equal (sort (mapcar #'car entries) #'string<)
                      (mapcar #'car subs))))))
+
+(ert-deftest keepass-browse-edit-slashy-title-templates-real-values ()
+  "The edit screen templates the real Title and Group for a slashy title.
+Deriving them from the path would truncate the title (renaming the entry
+on commit) and invent a phantom group."
+  (let* ((slashy "/Backups/Odd / Title – with /slashes")
+         (keepass-browse--entry-parents `((,slashy . "/Backups/")))
+         (box (list nil)))
+    (cl-letf (((symbol-function 'keepass-browse--entry-get)
+               (lambda (_) '(("Title" . "Odd / Title – with /slashes")
+                             ("UserName" . "chris"))))
+              ((symbol-function 'keepass-browse--entry-open)
+               (lambda (_name _action _path template)
+                 (setcar box template))))
+      (keepass-browse-edit slashy))
+    (should (string-match-p "^Group: /Backups/\n" (car box)))
+    (should (string-match-p
+             "\nTitle: Odd / Title – with /slashes\n" (car box)))))
 
 (ert-deftest keepass-browse-group-contents-includes-empty ()
   "`group-contents' lists empty groups recorded from the export tree."

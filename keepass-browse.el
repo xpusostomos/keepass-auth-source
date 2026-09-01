@@ -211,10 +211,11 @@ generation; thereafter the default offered.")
 
 (defvar keepass-browse--entry-parents nil
   "((ENTRY-PATH . GROUP-PATH)) real parent group per entry.
-Recorded from the export tree while collecting.  Titles may contain
-\"/\" (e.g. \"Pika Backup \\=\\='mnt/myhub\\='\"), so an entry's path
-string alone cannot be split into group and title -- this map is the
-only reliable record of where an entry lives.")
+Recorded from the export tree while collecting; the group and the title
+arrive separately and are kept separately.  Titles may contain
+\"/\", so an entry's path string alone cannot be split into group and
+title -- this map is the only reliable record of where an entry lives,
+for call sites that only have the path.")
 
 (defvar keepass-browse--group-icons nil
   "((PATH . (ICON-ID . CUSTOM-UUID))) per group from the last export.
@@ -432,7 +433,11 @@ string among the children, after the attributes slot."
 (defun keepass-browse--collect (node group-path)
   "Return ((PATH . FIELDS) ...) for export XML NODE under GROUP-PATH.
 The root group's own name is not part of entries' paths, but nested
-groups' names are."
+groups' names are.  Each entry's FIELDS also carry its \"Group\" (the
+GROUP-PATH it was collected under, trailing slash included) and its
+\"IconID\": group and title are known separately here and must stay that
+way -- a title containing \"/\" makes the PATH string ambiguous, so
+nothing downstream may re-derive group or title by splitting it."
   (let ((acc '()))
     ;; Add each entry in this node.
     (dolist (entry (keepass-browse--xml-children-tag node 'Entry))
@@ -442,6 +447,8 @@ groups' names are."
              (fields (if (and icon-id (not (string-empty-p icon-id)))
                          (cons (cons "IconID" icon-id) fields)
                        fields))
+             (fields (cons (cons "Group" (concat group-path "/"))
+                           fields))
              ;; The entry's custom icon, when it has one.
              (custom-id (keepass-browse--xml-tag-text entry 'CustomIconUUID))
              (title (cdr (assoc "Title" fields)))
@@ -449,10 +456,6 @@ groups' names are."
         (when (and custom-id (not (string-empty-p custom-id)))
           (push (cons path (string-trim custom-id))
                 keepass-browse--entry-custom-icons))
-        ;; Remember where the entry really lives: a title containing "/"
-        ;; makes the path string ambiguous, so the group path cannot be
-        ;; recovered from it later.  Stored with a trailing slash (the root
-        ;; is "/") so it compares equal to normalized group paths.
         (push (cons path (concat group-path "/"))
               keepass-browse--entry-parents)
         (setq acc (cons (cons path fields) acc))))
@@ -536,6 +539,13 @@ arithmetic -- see `keepass-browse--entry-directory'."
       (substring path (1+ (match-beginning 0)))
     path))
 
+(defun keepass-browse--entry-group (path)
+  "Return the real group of the entry at PATH, trailing slash included.
+The parent recorded from the export tree when known (a title containing
+\"/\" mis-splits the path string), else derived from the path."
+  (or (cdr (assoc path keepass-browse--entry-parents))
+      (keepass-browse--entry-directory path)))
+
 (defun keepass-browse--group-contents (entries group)
   "Return the immediate children of GROUP in ENTRIES.
 ENTRIES is a list of (PATH . FIELDS) pairs as returned by
@@ -551,14 +561,15 @@ from the entry paths and from the group tree recorded in
          (subgroups nil))
     (dolist (entry entries)
       (let* ((path (car entry))
-             (parent (cdr (assoc path keepass-browse--entry-parents))))
-        (if parent
-            ;; The real parent group is known from the export tree, so the
-            ;; entry belongs exactly there -- whatever its title contains
-            ;; (a title with "/" must not become phantom subgroups).
-            (when (string-equal parent group)
+             (fields (cdr entry))
+             (entry-group (cdr (assoc "Group" fields))))
+        (if entry-group
+            ;; The entry carries its real group: it belongs exactly there,
+            ;; whatever its title contains (a title with "/" must not
+            ;; become phantom subgroups).
+            (when (string-equal entry-group group)
               (push entry in-group))
-          ;; No recorded parent (synthetic data): fall back to the path.
+          ;; No recorded group (synthetic data): fall back to the path.
           (when (string-equal (keepass-browse--entry-directory path) group)
             (push entry in-group))
           ;; A path strictly deeper than GROUP contributes its next segment as a
@@ -975,7 +986,8 @@ which case there is nothing to hide."
         (insert (format "%-10s %s\n" "Database"
                         (or (keepass-browse--database-name) "(unknown)"))))
       (insert (format "%-10s %s\n" "Group"
-                      (keepass-browse--entry-directory keepass-browse-view-path)))
+                      (keepass-browse--entry-group
+                       keepass-browse-view-path)))
       (dolist (f '("Title" "UserName"))
         (insert (format "%-10s %s\n" f (keepass-browse--field entry f))))
       (insert (format "%-10s %s\n" "Password" pw))
@@ -1204,8 +1216,8 @@ group prefix) and the other fields, then commit with
   (keepass-browse--require-db)
   (let* ((group (if (and target (not (string-blank-p target)))
                     ;; Same group as the selected entry; pure string ops
-                    ;; only (see `keepass-browse--entry-directory').
-                    (keepass-browse--entry-directory
+                    ;; only (see `keepass-browse--entry-group').
+                    (keepass-browse--entry-group
                      (concat "/" (string-trim-left target "/")))
                   (keepass-browse--choose-group))))
     (keepass-browse--entry-open "*keepass-browse-add*" "add" nil
@@ -1235,15 +1247,24 @@ point in the entry buffer, this replaces the `Group:' line."
 (defun keepass-browse-edit (path)
   "Edit the entry at PATH in an entry buffer.
 The Group line holds the entry's group (the folder it sits in); the
-Title line the bare entry title.  The full path is tracked in
-`keepass-browse--entry-original', and the commit rebuilds the path from
-it, so editing does not become a spurious add/delete."
+Title line the entry's title.  Both come from the database rather than
+from PATH: a title containing \"/\" cannot be recovered by splitting the
+path (the last segment would silently rename the entry on commit).  The
+full path is tracked in `keepass-browse--entry-original', and the commit
+rebuilds the path from it, so editing does not become a spurious
+add/delete."
   (interactive "sEntry path: ")
+  ;; The recorded parent group comes from an export; if this edit was not
+  ;; reached through a browse listing, load once so it is available.
+  (unless (assoc path keepass-browse--entry-parents)
+    (keepass-browse--load-entries))
   (let* ((entry (keepass-browse--entry-get path))
-         (title (keepass-browse--entry-basename path)))
+         (title (or (keepass-browse--field entry "Title")
+                    (keepass-browse--entry-basename path)))
+         (group (keepass-browse--entry-group path)))
     (keepass-browse--entry-open "*keepass-browse-edit*" "edit" path
                                 (format "Group: %s\nTitle: %s\nUserName: %s\nPassword: %s\nURL: %s\nNotes: %s\n"
-                                        (keepass-browse--entry-directory path)
+                                        group
                                         title
                                         (keepass-browse--field entry "UserName")
                                         (keepass-browse--field entry "Password")
@@ -1253,10 +1274,12 @@ it, so editing does not become a spurious add/delete."
 (defun keepass-browse-clone (path)
   "Clone the entry at PATH into an entry buffer."
   (interactive "sEntry path: ")
+  (unless (assoc path keepass-browse--entry-parents)
+    (keepass-browse--load-entries))
   (let ((entry (keepass-browse--entry-get path)))
     (keepass-browse--entry-open
      "*keepass-browse-clone*" "add" nil
-     (concat (format "Group: %s\n" (keepass-browse--entry-directory path))
+     (concat (format "Group: %s\n" (keepass-browse--entry-group path))
              (mapconcat (lambda (f)
                           (format "%s: %s" f (keepass-browse--field entry f)))
                         '("Title" "UserName" "Password" "URL" "Notes")
@@ -1307,7 +1330,7 @@ delete+add and never creates a Recycle-Bin duplicate."
          (group (if (string-empty-p group)
                     ;; No Group given: keep the entry where it already is
                     ;; (edit), or root for a new entry.
-                    (if original (keepass-browse--entry-directory original) "")
+                    (if original (keepass-browse--entry-group original) "")
                   (if (string-suffix-p "/" group) group (concat group "/"))))
          ;; Where the entry ends up after this commit.
          (new-path (if (string-prefix-p "/" title) title (concat group title))))
@@ -1331,7 +1354,8 @@ delete+add and never creates a Recycle-Bin duplicate."
            (run
             (cond
              ((string= action "edit")
-              (let* ((orig-group (keepass-browse--entry-directory (or original "")))
+              (let* ((orig-group (keepass-browse--entry-group
+                                  (or original "")))
                      (moved (not (string-equal orig-group group))))
                 (if (not moved)
                     ;; Same group: `edit -t' renames in place.
@@ -1339,8 +1363,14 @@ delete+add and never creates a Recycle-Bin duplicate."
                            (append (list "edit") global (list db original "-t" title) common))
                   ;; Different group: move first, then edit fields/title at the
                   ;; new site, so the entry is never deleted and re-added.
-                  (let* ((orig-title (keepass-browse--entry-basename original))
-                         (tmp (concat group orig-title))
+                  ;; The entry's title as it exists NOW cannot be derived
+                  ;; from ORIGINAL when the title contains "/" -- fetch it.
+                  (let* ((old-title (or (ignore-errors
+                                          (keepass-browse--field
+                                           (keepass-browse--entry-get original)
+                                           "Title"))
+                                        (keepass-browse--entry-basename original)))
+                         (tmp (concat group old-title))
                          (mv (apply #'keepass-auth-source--keepassxc-run-stdin stdin
                                     (append (list "mv") global (list db original group)))))
                     (unless (eq (cdr mv) 0)
