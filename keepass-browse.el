@@ -1608,6 +1608,203 @@ Returns the chosen entry path."
         (funcall keepass-browse-default-action result))
       result)))
 
+;;;; Favorites
+
+(defcustom keepass-browse-favorites-default nil
+  "Favorites offered by `keepass-browse-favorites' and
+`keepass-browse-favorites-embark'.
+A list of favorite spec plists.  Each spec item describes one favorite:
+
+  (:key   ?b                 ; key in the favorites menu
+   :title \"Pika\"            ; regexp against the entry's Title
+   :group \"^/Backups/\")     ; regexp against the entry's group path
+
+:title and :group are regular expressions; both may be given, and an
+entry matches when every given regexp matches.  The group regexp runs
+against the entry's full group path as keepassxc stores it, with a
+trailing slash -- \"^/Backups/\" matches the Backups group and
+everything in it, while \"/Sales/\" matches a Sales group at any
+depth.  The title regexp runs against the entry's Title verbatim.
+
+At least one of :title and :group must be given: items with neither are
+ignored with a message when the favorites are used.  :key must be a
+character (a one-character string works too) and unique across the
+spec; broken or duplicate items are ignored with a message.  :key is
+only used by `keepass-browse-favorites-embark'; `keepass-browse-favorites'
+narrows by typing instead."
+  :type '(repeat (plist :key-type (choice (const :key)
+                                          (const :title)
+                                          (const :group))
+                        :value-type sexp))
+  :group 'keepass-browse)
+
+(defun keepass-browse-favorites--parse (favorites &optional require-key)
+  "Return the usable items of FAVORITES, a list of favorite spec plists.
+Each usable item becomes (KEY TITLE-REGEXP GROUP-REGEXP), either regexp
+and KEY possibly nil.  Unusable items -- no :title and no :group, or
+non-string regexps -- are dropped with a message, not an error.  When
+REQUIRE-KEY is non-nil, items without a usable :key (a character or
+one-character string) are dropped too: the keyed menu in
+`keepass-browse-favorites-embark' needs one, while
+`keepass-browse-favorites' matches without it.  A :key already used by
+an earlier item is dropped with a message, in either mode."
+  (let ((items nil) (keys nil))
+    (dolist (favorite favorites)
+      (let* ((raw-key (plist-get favorite :key))
+             (title (plist-get favorite :title))
+             (group (plist-get favorite :group))
+             (key (cond ((characterp raw-key) raw-key)
+                        ((and (stringp raw-key)
+                              (= (length raw-key) 1))
+                         (aref raw-key 0)))))
+        (cond
+         ((and require-key (null key))
+          (message "keepass-browse favorites: ignoring %S -- the keyed menu needs a :key character"
+                   favorite))
+         ((not (and (or (null title) (stringp title))
+                    (or (null group) (stringp group))))
+          (message "keepass-browse favorites: ignoring %S -- :title and :group should be strings"
+                   favorite))
+         ((and (or (null title) (string-empty-p title))
+               (or (null group) (string-empty-p group)))
+          (message "keepass-browse favorites: ignoring %S -- give :title or :group"
+                   favorite))
+         ((and key (memq key keys))
+          (message "keepass-browse favorites: ignoring %S -- key ?%c is already used"
+                   favorite key))
+         (t
+          (when key (push key keys))
+          (push (list key title group) items)))))
+    (nreverse items)))
+
+(defun keepass-browse-favorites--match (spec entries)
+  "Return the entries in ENTRIES matching any item of SPEC.
+SPEC is a list of (KEY TITLE-REGEXP GROUP-REGEXP) items as returned by
+`keepass-browse-favorites--parse'.  An item matches an entry when every
+regexp it carries matches -- TITLE-REGEXP against the entry's Title,
+GROUP-REGEXP against its full group path with trailing slash.  The
+result is deduplicated on (group . title), the entry's identity: two
+spec items may match the same entry, and it should only be offered
+once."
+  (let ((matches nil) (seen nil))
+    (dolist (item spec)
+      (let ((title-re (nth 1 item)) (group-re (nth 2 item)))
+        (dolist (entry entries)
+          (let* ((fields (cdr entry))
+                 (title (cdr (assoc "Title" fields)))
+                 (group (cdr (assoc "Group" fields)))
+                 (identity (cons group title)))
+            (when (and (or (null title-re)
+                           (and title (string-match-p title-re title)))
+                       (or (null group-re)
+                           (and group (string-match-p group-re group))))
+              (unless (member identity seen)
+                (push identity seen)
+                (push entry matches)))))))
+    (nreverse matches)))
+
+(defun keepass-browse-favorites--choice (item)
+  "Return the `read-multiple-choice' menu entry for favorite ITEM.
+The name is the item's title when given, else its group; the
+description is the group, when the title was used as the name."
+  (let ((key (nth 0 item)) (title (nth 1 item)) (group (nth 2 item)))
+    (if title
+        (list key title group)
+      (list key group))))
+
+;;;###autoload
+(defun keepass-browse-favorites (&optional favorites)
+  "Select among the entries matching FAVORITES.
+FAVORITES is a favorites spec -- a list of plists as documented in
+`keepass-browse-favorites-default' -- and defaults to it.  Every entry
+matching any spec item is offered in a completion list; RET runs
+`keepass-browse-default-action' and \\[embark-act] opens the usual
+embark action menu.  The spec's :key is not used by this command.  Each
+entry is offered once, even when several spec items match it.  Returns
+the chosen entry path."
+  (interactive)
+  (keepass-browse--require-db)
+  (let* ((spec (keepass-browse-favorites--parse
+                (or favorites keepass-browse-favorites-default)))
+         (entries (and spec (keepass-browse--load-entries)))
+         (matches (and spec entries
+                       (keepass-browse-favorites--match spec entries))))
+    (when (null spec)
+      (user-error "No usable favorites in `keepass-browse-favorites-default'"))
+    (when (null matches)
+      (user-error "No entries match any of the favorites"))
+    (let ((keepass-browse--selecting t))
+      (let* ((chosen (consult--read
+                      (mapcar (lambda (e)
+                                (keepass-browse--format-candidate
+                                 (car e) (cdr e)))
+                              matches)
+                      :prompt "KeePass favorite: "
+                      :history keepass-browse-history
+                      :category 'keepass-browse
+                      :require-match t
+                      :sort nil
+                      :lookup #'consult--lookup-member))
+             (path (keepass-browse--path-of chosen)))
+        (if (null path)
+            (user-error "no path on candidate")
+          (when keepass-browse-default-action
+            (funcall keepass-browse-default-action path))
+          path)))))
+
+;;;###autoload
+(defun keepass-browse-favorites-embark (&optional favorites)
+  "Choose a favorite from FAVORITES and act on what it matches.
+FAVORITES is a favorites spec -- a list of plists as documented in
+`keepass-browse-favorites-default' -- and defaults to it.  The
+favorites are offered as a keyed menu (key, title or group, group);
+picking one searches the database for the entries it matches.  A single
+match goes straight to the embark action menu on that entry (view,
+copy, insert, ...); several matches are offered in a completion list
+first, exactly like `keepass-browse'."
+  (interactive)
+  (keepass-browse--require-db)
+  (let* ((spec (keepass-browse-favorites--parse
+                (or favorites keepass-browse-favorites-default)
+                'require-key))
+         (entries (and spec (keepass-browse--load-entries))))
+    (when (null spec)
+      (user-error "No usable favorites with a :key in `keepass-browse-favorites-default'"))
+    (let* ((choices (mapcar #'keepass-browse-favorites--choice spec))
+           (chosen (read-multiple-choice "Favorite: " choices))
+           (item (seq-find (lambda (i) (eq (nth 0 i) (car chosen))) spec))
+           (matches (keepass-browse-favorites--match (list item) entries))
+           (label (or (nth 1 item) (nth 2 item))))
+      (pcase (length matches)
+        (0 (user-error "No entries match the favorite %s" label))
+        (1 (let* ((entry (car matches))
+                  (candidate (keepass-browse--format-candidate
+                              (car entry) (cdr entry))))
+             ;; Inject the entry as embark's target so the prompter offers
+             ;; the usual keepass-browse action menu on it.
+             (let ((embark-target-finders
+                    (cons (lambda () (cons 'keepass-browse candidate))
+                          embark-target-finders)))
+               (embark-act))))
+        (_ (let ((keepass-browse--selecting t))
+             (let* ((chosen (consult--read
+                             (mapcar (lambda (e)
+                                       (keepass-browse--format-candidate
+                                        (car e) (cdr e)))
+                                     matches)
+                             :prompt (format "KeePass favorite %s: " label)
+                             :history keepass-browse-history
+                             :category 'keepass-browse
+                             :require-match t
+                             :sort nil
+                             :lookup #'consult--lookup-member))
+                    (path (keepass-browse--path-of chosen)))
+               (if (null path)
+                   (user-error "no path on candidate")
+                 (when keepass-browse-default-action
+                   (funcall keepass-browse-default-action path))
+                 path))))))))
+
 (defun keepass-browse--check-databases ()
   "Signal a clear error if `keepass-browse-databases' has the wrong shape.
 Each element must be a database spec plist (see `keepass-db-spec-p')."

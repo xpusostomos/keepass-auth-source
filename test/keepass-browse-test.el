@@ -501,6 +501,136 @@ on commit) and invent a phantom group."
     (should (string-match-p
              "\nTitle: Odd / Title – with /slashes\n" (car box)))))
 
+(ert-deftest keepass-browse-favorites-parse ()
+  "`favorites--parse' keeps usable items and drops broken ones with a
+message, never an error.  A :key is only required when REQUIRE-KEY is
+non-nil (the keyed menu)."
+  ;; Matching mode: a keyless item with a :group or :title is fine.
+  (should (equal '((?b "Pika" "^/Backups/")
+                   (?m nil "str-key")
+                   (nil "keyless" nil)
+                   (nil nil "Pika"))
+                 (keepass-browse-favorites--parse
+                  '((:key ?b :group "^/Backups/" :title "Pika")
+                    (:key "m" :group "str-key")
+                    (:title "keyless")
+                    (:group "Pika")
+                    (:key ?c)
+                    (:key ?b :title "dup")
+                    (:key ?x :title 42 :group "^/G")
+                    (:key ?z :group "^/G" :title 42)))))
+  ;; Keyed-menu mode: keyless items are dropped.
+  (should (equal '((?b "Pika" "^/Backups/") (?m nil "str-key"))
+                 (keepass-browse-favorites--parse
+                  '((:key ?b :group "^/Backups/" :title "Pika")
+                    (:key "m" :group "str-key")
+                    (:title "keyless")
+                    (:group "Pika")
+                    (:key ?c)
+                    (:key ?b :title "dup")
+                    (:key ?x :title 42 :group "^/G")
+                    (:key ?z :group "^/G" :title 42))
+                  'require-key))))
+
+(ert-deftest keepass-browse-favorites-match ()
+  "`favorites--match' ANDs the given regexps, matches the group with
+its trailing slash, and deduplicates on (group . title)."
+  (let* ((entries '(("/Mail/gmail" . (("Group" . "/Mail/")
+                                      ("Title" . "gmail")))
+                    ("/Backups/Pika" . (("Group" . "/Backups/")
+                                        ("Title" . "Pika")))
+                    ("/Backups/Pika-old" . (("Group" . "/Backups/")
+                                            ("Title" . "Pika-old")))))
+         (spec '((?m nil "^/Mail/")
+                 (?p "Pika" nil)
+                 (?a "Pika" "^/Backups/")))
+         (matched (keepass-browse-favorites--match spec entries)))
+    ;; ?p and ?a both match /Backups/Pika: offered once (3 results total).
+    (should (= 3 (length matched)))
+    (should (equal '("/Backups/Pika" "/Backups/Pika-old" "/Mail/gmail")
+                   (sort (mapcar #'car matched) #'string<)))
+    ;; AND semantics: "gmail" in the /Backups group matches nothing.
+    (should (null (keepass-browse-favorites--match
+                   '((?x "gmail" "^/Backups/")) entries)))
+    ;; Anchors: an exact group path matches only that group.
+    (should (equal '("/Mail/gmail")
+                   (mapcar #'car (keepass-browse-favorites--match
+                                  '((?x nil "\\`/Mail/\\'")) entries))))))
+
+(ert-deftest keepass-browse-favorites-choice ()
+  "`favorites--choice' prefers the title for the name, group as
+description; group alone is the name."
+  (should (equal '(?b "Pika" "/Backups/")
+                 (keepass-browse-favorites--choice '(?b "Pika" "/Backups/"))))
+  (should (equal '(?s "Secret")
+                 (keepass-browse-favorites--choice '(?s nil "Secret")))))
+
+(ert-deftest keepass-browse-favorites-selects-matches ()
+  "`keepass-browse-favorites' offers exactly the matching entries."
+  (keepass-browse-test-with-db
+    (let* ((keepass-browse-favorites-default
+            '((:key ?g :title "github") (:key ?e :title "email")))
+           (keepass-browse--selecting t)
+           (entry-box (list nil))
+           (keepass-browse-default-action
+            (lambda (p) (setcar entry-box p)))
+           (path (cl-letf (((symbol-function 'consult--read)
+                            (lambda (candidates &rest _)
+                              ;; Both spec items match: 2 candidates.
+                              (should (= 2 (length candidates)))
+                              (car candidates))))
+               (keepass-browse-favorites))))
+      (should (member path '("/email" "/Work/github")))
+      (should (equal path (car entry-box)))
+      ;; A spec item with neither :title nor :group is ignored, not fatal.
+      (let ((keepass-browse-favorites-default '((:key ?x))))
+        (should-error (keepass-browse-favorites) :type 'user-error)))))
+
+(ert-deftest keepass-browse-favorites-keyless-spec ()
+  "A spec item without :key works for plain matching -- only the keyed
+menu needs a key."
+  (keepass-browse-test-with-db
+    (let* ((keepass-browse-favorites-default '((:group "^/Work/")))
+           (keepass-browse--selecting t)
+           (entry-box (list nil))
+           (keepass-browse-default-action
+            (lambda (p) (setcar entry-box p)))
+           (path (cl-letf (((symbol-function 'consult--read)
+                            (lambda (candidates &rest _)
+                              (should (= 1 (length candidates)))
+                              (car candidates))))
+               (keepass-browse-favorites))))
+      (should (equal "/Work/github" path))
+      (should (equal "/Work/github" (car entry-box)))
+      (let ((keepass-browse-favorites-default '((:key ?x))))
+        (should-error (keepass-browse-favorites) :type 'user-error)))))
+
+(ert-deftest keepass-browse-favorites-embark-flows ()
+  "`favorites-embark': one match goes to the embark action menu; several
+matches go to a completion list first."
+  (keepass-browse-test-with-db
+    (let* ((keepass-browse-favorites-default
+            '((:key ?g :title "github") (:key ?a :title ".")))
+           (menu-box (list nil))
+           (entry-box (list nil))
+           (keepass-browse-default-action (lambda (p) (setcar entry-box p))))
+      ;; Single match: the embark action menu on the github entry.
+      (cl-letf (((symbol-function 'read-multiple-choice)
+                 (lambda (_prompt choices &optional _help _show)
+                   (assq ?g choices)))
+                ((symbol-function 'embark-act)
+                 (lambda () (setcar menu-box t))))
+        (keepass-browse-favorites-embark))
+      (should (car menu-box))
+      ;; Several matches (every entry): completion list, then default action.
+      (cl-letf (((symbol-function 'read-multiple-choice)
+                 (lambda (_prompt choices &optional _help _show)
+                   (assq ?a choices)))
+                ((symbol-function 'consult--read)
+                 (lambda (candidates &rest _) (car candidates))))
+        (keepass-browse-favorites-embark))
+      (should (member (car entry-box) '("/email" "/Work/github"))))))
+
 (ert-deftest keepass-browse-group-contents-includes-empty ()
   "`group-contents' lists empty groups recorded from the export tree."
   (let* ((keepass-browse--group-icons
