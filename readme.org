@@ -416,6 +416,35 @@ and =insert password= (=[U]=) at point, and the =keepass-browse-insert-password=
 and =keepass-browse-insert-username= commands are available directly if
 you want to insert a password into your current buffer.
 
+**** Binding all the commands at once
+
+=keepass-browse-command-map= is a sparse keymap holding every command of
+this package, so one line binds them all:
+
+#+BEGIN_SRC elisp
+  (keymap-global-set "C-:" 'keepass-browse-command-map)
+#+END_SRC
+
+The default bindings under the prefix (=C-:= here, any prefix you like):
+
+| key   | command                             |
+|-------+-------------------------------------|
+| =t=   | =keepass-browse=                    |
+| =g=   | =keepass-browse-group=              |
+| =d=   | =keepass-browse-select-database=    |
+| =f=   | =keepass-browse-favorites=          |
+| =k=   | =keepass-browse-favorites-embark=   |
+| =c=   | =keepass-auth-source-forget-cached= |
+
+On Emacs versions without =keymap-global-set= (pre-29), the classic
+spelling is:
+#+BEGIN_SRC elisp
+  (global-set-key (kbd "C-:") 'keepass-browse-command-map)
+#+END_SRC
+
+The map is autoloaded, so the binding works even before the package is
+loaded.  Any prefix key works -- bind =F5= or =C-c k= the same way.
+
 **** The entry view
 
 =keepass-browse-view= shows an entry with its password hidden:

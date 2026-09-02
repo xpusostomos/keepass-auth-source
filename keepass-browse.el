@@ -1638,16 +1638,12 @@ narrows by typing instead."
                         :value-type sexp))
   :group 'keepass-browse)
 
-(defun keepass-browse-favorites--parse (favorites &optional require-key)
+(defun keepass-browse-favorites--parse (favorites)
   "Return the usable items of FAVORITES, a list of favorite spec plists.
 Each usable item becomes (KEY TITLE-REGEXP GROUP-REGEXP), either regexp
-and KEY possibly nil.  Unusable items -- no :title and no :group, or
-non-string regexps -- are dropped with a message, not an error.  When
-REQUIRE-KEY is non-nil, items without a usable :key (a character or
-one-character string) are dropped too: the keyed menu in
-`keepass-browse-favorites-embark' needs one, while
-`keepass-browse-favorites' matches without it.  A :key already used by
-an earlier item is dropped with a message, in either mode."
+and KEY possibly nil (the keyed menu assigns keys to nil-key items).
+Unusable items -- no :title and no :group, non-string regexps, or a
+duplicate :key -- are dropped with a message, not an error."
   (let ((items nil) (keys nil))
     (dolist (favorite favorites)
       (let* ((raw-key (plist-get favorite :key))
@@ -1658,9 +1654,6 @@ an earlier item is dropped with a message, in either mode."
                               (= (length raw-key) 1))
                          (aref raw-key 0)))))
         (cond
-         ((and require-key (null key))
-          (message "keepass-browse favorites: ignoring %S -- the keyed menu needs a :key character"
-                   favorite))
          ((not (and (or (null title) (stringp title))
                     (or (null group) (stringp group))))
           (message "keepass-browse favorites: ignoring %S -- :title and :group should be strings"
@@ -1712,6 +1705,43 @@ description is the group, when the title was used as the name."
         (list key title group)
       (list key group))))
 
+(defconst keepass-browse-favorites--key-pool
+  (append (string-to-list "123456789")
+          (string-to-list "abcdefghijklmnopqrstuvwxyz")
+          (string-to-list "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+  "Characters that may be hotkeys in a favorites menu.")
+
+(defun keepass-browse-favorites--key-for (label used)
+  "Return an unassigned key for the menu entry labelled LABEL.
+USED is the list of characters already taken.  Two phases: the first
+unused character of LABEL itself that is a regular set character --
+digit, lowercase or uppercase letter; never punctuation -- falling back
+to the first unused character of `keepass-browse-favorites--key-pool'
+(a mnemonic -- \"github\" offers ?g when free; \"@Mail\" skips ?@ and
+offers ?M)."
+  (or (seq-find (lambda (c)
+                  (and (not (memq c used))
+                       (memq c keepass-browse-favorites--key-pool)))
+                (string-to-list label))
+      (seq-find (lambda (c) (not (memq c used)))
+                keepass-browse-favorites--key-pool)
+      (user-error "No unused keys left for the favorites menu -- set :key on some items")))
+
+(defun keepass-browse-favorites--assign-keys (spec)
+  "Return SPEC with a key on every item.
+Items with a :key keep it.  A keyless item's key comes from
+`keepass-browse-favorites--key-for', given its label -- the title when
+the item has one, else its group -- and the keys taken so far."
+  (let ((used (delq nil (mapcar (lambda (i) (nth 0 i)) spec))))
+    (mapcar (lambda (item)
+              (if (nth 0 item)
+                  item
+                (let ((key (keepass-browse-favorites--key-for
+                            (or (nth 1 item) (nth 2 item)) used)))
+                  (push key used)
+                  (append (list key) (cdr item)))))
+            spec)))
+
 ;;;###autoload
 (defun keepass-browse-favorites (&optional favorites)
   "Select among the entries matching FAVORITES.
@@ -1753,6 +1783,17 @@ the chosen entry path."
           path)))))
 
 ;;;###autoload
+(defun keepass-browse-favorites--embark-entry (entry)
+  "Open the embark action menu for matched ENTRY (PATH . FIELDS).
+The embark target is the entry's real path with the select action map --
+copy, view, edit and the insert-at-point actions."
+  (let ((path (car entry)))
+    (let ((embark-target-finders
+           (cons (lambda ()
+                   (cons 'keepass-browse-select path))
+                 embark-target-finders)))
+      (embark-act))))
+
 (defun keepass-browse-favorites-embark (&optional favorites)
   "Choose a favorite from FAVORITES and act on what it matches.
 FAVORITES is a favorites spec -- a list of plists as documented in
@@ -1760,16 +1801,16 @@ FAVORITES is a favorites spec -- a list of plists as documented in
 favorites are offered as a keyed menu (key, title or group, group);
 picking one searches the database for the entries it matches.  A single
 match goes straight to the embark action menu on that entry (view,
-copy, insert, ...); several matches are offered in a completion list
-first, exactly like `keepass-browse'."
+copy, insert, ...); several matches are offered in a keyed menu of
+their own first, then the chosen entry goes to the same action menu."
   (interactive)
   (keepass-browse--require-db)
-  (let* ((spec (keepass-browse-favorites--parse
-                (or favorites keepass-browse-favorites-default)
-                'require-key))
+  (let* ((spec (keepass-browse-favorites--assign-keys
+                (keepass-browse-favorites--parse
+                 (or favorites keepass-browse-favorites-default))))
          (entries (and spec (keepass-browse--load-entries))))
     (when (null spec)
-      (user-error "No usable favorites with a :key in `keepass-browse-favorites-default'"))
+      (user-error "No usable favorites in `keepass-browse-favorites-default'"))
     (let* ((choices (mapcar #'keepass-browse-favorites--choice spec))
            (chosen (read-multiple-choice "Favorite: " choices))
            (item (seq-find (lambda (i) (eq (nth 0 i) (car chosen))) spec))
@@ -1777,33 +1818,29 @@ first, exactly like `keepass-browse'."
            (label (or (nth 1 item) (nth 2 item))))
       (pcase (length matches)
         (0 (user-error "No entries match the favorite %s" label))
-        (1 (let* ((entry (car matches))
-                  (candidate (keepass-browse--format-candidate
-                              (car entry) (cdr entry))))
-             ;; Inject the entry as embark's target so the prompter offers
-             ;; the usual keepass-browse action menu on it.
-             (let ((embark-target-finders
-                    (cons (lambda () (cons 'keepass-browse candidate))
-                          embark-target-finders)))
-               (embark-act))))
-        (_ (let ((keepass-browse--selecting t))
-             (let* ((chosen (consult--read
-                             (mapcar (lambda (e)
-                                       (keepass-browse--format-candidate
-                                        (car e) (cdr e)))
-                                     matches)
-                             :prompt (format "KeePass favorite %s: " label)
-                             :history keepass-browse-history
-                             :category 'keepass-browse
-                             :require-match t
-                             :sort nil
-                             :lookup #'consult--lookup-member))
-                    (path (keepass-browse--path-of chosen)))
-               (if (null path)
-                   (user-error "no path on candidate")
-                 (when keepass-browse-default-action
-                   (funcall keepass-browse-default-action path))
-                 path))))))))
+        (1 (keepass-browse-favorites--embark-entry (car matches)))
+        (_ (let* ((pseudo (mapcar (lambda (e)
+                                    (list nil
+                                          (keepass-browse--field (cdr e) "Title")
+                                          (keepass-browse--field (cdr e) "Group")))
+                                  matches))
+                   (keyed (keepass-browse-favorites--assign-keys pseudo))
+                   (choices (mapcar #'keepass-browse-favorites--choice keyed))
+                   (chosen (read-multiple-choice "Matching entries: " choices))
+                   (picked (seq-find (lambda (i) (eq (nth 0 i) (car chosen)))
+                                     keyed))
+                   (pick-title (nth 1 picked))
+                   (pick-group (nth 2 picked))
+                   (entry (seq-find
+                           (lambda (e)
+                             (and (string= (keepass-browse--field (cdr e) "Title")
+                                           pick-title)
+                                  (string= (keepass-browse--field (cdr e) "Group")
+                                           pick-group)))
+                           matches)))
+              (if (null entry)
+                  (user-error "no path on candidate")
+                (keepass-browse-favorites--embark-entry entry))))))))
 
 (defun keepass-browse--check-databases ()
   "Signal a clear error if `keepass-browse-databases' has the wrong shape.
@@ -1846,6 +1883,32 @@ Completes over each entry's label (its `:name', or the file name)."
     (setq keepass-browse-database entry)
     (message "Using KeePass database %s" chosen)
     keepass-browse-database))
+
+;;;; Command keymap
+;;
+;; One sparse keymap so users can bind every keepass command with a single
+;; line in their init:
+;;
+;;   (keymap-global-set "C-:" 'keepass-browse-command-map)
+;;
+;; `define-prefix-command' defines `keepass-browse-command-map' both as the
+;; keymap variable and as a prefix command, and the autoload cookie makes
+;; the binding work even before this file is loaded.
+
+;;;###autoload (define-prefix-command 'keepass-browse-command-map)
+(defvar keepass-browse-command-map)
+
+;; Creating it here as well as in the autoloads makes the map work both for
+;; a package install and for a plain load-path `require' in init.
+(define-prefix-command 'keepass-browse-command-map)
+
+(define-key keepass-browse-command-map (kbd "t") #'keepass-browse)
+(define-key keepass-browse-command-map (kbd "g") #'keepass-browse-group)
+(define-key keepass-browse-command-map (kbd "d") #'keepass-browse-select-database)
+(define-key keepass-browse-command-map (kbd "f") #'keepass-browse-favorites)
+(define-key keepass-browse-command-map (kbd "k") #'keepass-browse-favorites-embark)
+;; `f' was taken by the favorites; `c' clears the cached master password.
+(define-key keepass-browse-command-map (kbd "c") #'keepass-auth-source-forget-cached)
 
 (provide 'keepass-browse)
 ;;; keepass-browse.el ends here
